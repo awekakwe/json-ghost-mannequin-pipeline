@@ -1,0 +1,612 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2822
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\paperw11900\paperh16840\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\pard\tx566\tx1133\tx1700\tx2267\tx2834\tx3401\tx3968\tx4535\tx5102\tx5669\tx6236\tx6803\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 #!/usr/bin/env python3\
+# step6_feedback_engine.py\
+# Learn & Improve: ingest QA+manifest, score, store, alert, suggest tuning.\
+\
+from __future__ import annotations\
+\
+import argparse\
+import json\
+import os\
+import sys\
+import sqlite3\
+from pathlib import Path\
+from datetime import datetime, timezone\
+from typing import Any, Dict, List, Optional, Tuple\
+\
+# -------- Optional deps (all graceful) --------\
+try:\
+    import yaml\
+    HAVE_YAML = True\
+except Exception:\
+    HAVE_YAML = False\
+\
+try:\
+    import requests  # noqa: F401  (used via HAVE_REQUESTS)\
+    HAVE_REQUESTS = True\
+except Exception:\
+    HAVE_REQUESTS = False\
+\
+try:\
+    import psycopg2\
+    from psycopg2.extras import Json\
+    HAVE_PG = True\
+except Exception:\
+    HAVE_PG = False\
+\
+\
+# =========================\
+# Utilities\
+# =========================\
+\
+def _now_iso() -> str:\
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")\
+\
+\
+def _parse_iso(ts: Optional[str]) -> Optional[datetime]:\
+    if not ts:\
+        return None\
+    t = ts.strip()\
+    # allow "YYYY-MM-DDTHH:MM:SSZ" or with offset\
+    try:\
+        if t.endswith("Z"):\
+            return datetime.fromisoformat(t.replace("Z", "+00:00"))\
+        return datetime.fromisoformat(t)\
+    except Exception:\
+        return None\
+\
+\
+def _seconds_between(start_iso: Optional[str], end_iso: Optional[str]) -> Optional[float]:\
+    s = _parse_iso(start_iso)\
+    e = _parse_iso(end_iso)\
+    if s and e:\
+        delta = (e - s).total_seconds()\
+        if delta >= 0:\
+            return float(delta)\
+    return None\
+\
+\
+def read_json(path: Path) -> Dict[str, Any]:\
+    try:\
+        return json.loads(path.read_text(encoding="utf-8"))\
+    except Exception:\
+        return \{\}\
+\
+\
+# =========================\
+# Storage\
+# =========================\
+\
+def open_db(db_path: Optional[str]):\
+    """\
+    If DATABASE_URL is provided and psycopg2 is available, use Postgres.\
+    Otherwise, use SQLite at db_path.\
+    Returns: (kind, connection)\
+    """\
+    url = os.getenv("DATABASE_URL")\
+    if url and HAVE_PG and url.startswith(("postgres://", "postgresql://")):\
+        return ("postgres", psycopg2.connect(url))\
+    # SQLite fallback\
+    p = Path(db_path or "./step6/feedback.db")\
+    p.parent.mkdir(parents=True, exist_ok=True)\
+    conn = sqlite3.connect(str(p))\
+    return ("sqlite", conn)\
+\
+\
+def init_schema(kind: str, conn) -> None:\
+    if kind == "postgres":\
+        cur = conn.cursor()\
+        cur.execute("""\
+        CREATE TABLE IF NOT EXISTS runs (\
+            run_id TEXT PRIMARY KEY,\
+            session_id TEXT,\
+            sku TEXT, variant TEXT,\
+            template_id TEXT, route TEXT,\
+            started_at TIMESTAMPTZ, finished_at TIMESTAMPTZ\
+        );""")\
+        cur.execute("""\
+        CREATE TABLE IF NOT EXISTS qa_metrics (\
+            run_id TEXT PRIMARY KEY REFERENCES runs(run_id),\
+            mean_delta_e REAL, p95_delta_e REAL,\
+            ghost_pass BOOLEAN, label_readable BOOLEAN,\
+            sharpness REAL, ssim REAL, lpips REAL\
+        );""")\
+        cur.execute("""\
+        CREATE TABLE IF NOT EXISTS tuning_events (\
+            event_id TEXT PRIMARY KEY,\
+            run_id TEXT REFERENCES runs(run_id),\
+            param JSON, reason TEXT, created_at TIMESTAMPTZ DEFAULT now()\
+        );""")\
+        # Helpful indexes for rolling metrics lookups\
+        cur.execute("CREATE INDEX IF NOT EXISTS runs_sku_variant_started_idx ON runs (sku, variant, started_at);")\
+        cur.execute("CREATE INDEX IF NOT EXISTS qa_metrics_flags_idx ON qa_metrics (ghost_pass, label_readable);")\
+        conn.commit()\
+    else:\
+        cur = conn.cursor()\
+        cur.execute("""\
+        CREATE TABLE IF NOT EXISTS runs (\
+            run_id TEXT PRIMARY KEY,\
+            session_id TEXT,\
+            sku TEXT, variant TEXT,\
+            template_id TEXT, route TEXT,\
+            started_at TEXT, finished_at TEXT\
+        );""")\
+        cur.execute("""\
+        CREATE TABLE IF NOT EXISTS qa_metrics (\
+            run_id TEXT PRIMARY KEY,\
+            mean_delta_e REAL, p95_delta_e REAL,\
+            ghost_pass INTEGER, label_readable INTEGER,\
+            sharpness REAL, ssim REAL, lpips REAL\
+        );""")\
+        cur.execute("""\
+        CREATE TABLE IF NOT EXISTS tuning_events (\
+            event_id TEXT PRIMARY KEY,\
+            run_id TEXT,\
+            param TEXT, reason TEXT, created_at TEXT\
+        );""")\
+        cur.execute("CREATE INDEX IF NOT EXISTS runs_sku_variant_started_idx ON runs (sku, variant, started_at);")\
+        cur.execute("CREATE INDEX IF NOT EXISTS qa_metrics_flags_idx ON qa_metrics (ghost_pass, label_readable);")\
+        conn.commit()\
+\
+\
+# =========================\
+# Health score & severity\
+# =========================\
+\
+def health_score(mean_de: float, pass_rate: float, proc_time: float,\
+                 targets: Tuple[float, float, float] = (2.0, 0.85, 3.0)) -> float:\
+    """\
+    Normalize and weight: lower \uc0\u916 E and time are better; higher pass_rate better.\
+    """\
+    try:\
+        de_score = max(0.0, min(1.0, targets[0] / max(float(mean_de), 1e-6)))\
+    except Exception:\
+        de_score = 0.7\
+    try:\
+        pr_score = max(0.0, min(1.0, float(pass_rate) / float(targets[1])))\
+    except Exception:\
+        pr_score = 0.7\
+    try:\
+        spd_score = max(0.0, min(1.0, targets[2] / max(float(proc_time), 1e-6)))\
+    except Exception:\
+        spd_score = 0.7\
+    return 0.45 * de_score + 0.35 * pr_score + 0.20 * spd_score\
+\
+\
+def severity_from_score(score: float) -> str:\
+    if score < 0.6:\
+        return "CRITICAL"\
+    if score < 0.8:\
+        return "WARN"\
+    return "OK"\
+\
+\
+# =========================\
+# Rules / Tuner\
+# =========================\
+\
+def load_rules(path: Path) -> List[Dict[str, Any]]:\
+    if path.exists() and HAVE_YAML:\
+        try:\
+            data = yaml.safe_load(path.read_text(encoding="utf-8"))\
+            return data or []\
+        except Exception:\
+            pass\
+    # Default minimal rules if YAML missing\
+    return [\
+        \{"when": "mean_delta_e > 2.5 and overall_pass_rate < 1.0",\
+         "actions": ["step3.guidance_scale += 0.5", "step2.enforce_primary_hex = 1"]\},\
+        \{"when": "ghost_pass_rate < 0.8",\
+         "actions": ["step3.hollow_enhancement_strength += 0.1"]\},\
+        \{"when": "processing_time > 4.0",\
+         "actions": ["step3.num_inference_steps -= 2"]\},\
+    ]\
+\
+\
+def _eval_comparison(token_l: str, op: str, token_r: str, ctx: Dict[str, Any]) -> bool:\
+    # supports float values in ctx; booleans are cast to 0/1\
+    try:\
+        lhs = float(ctx.get(token_l, 0.0))\
+    except Exception:\
+        lhs = 0.0\
+    try:\
+        rhs = float(token_r)\
+    except Exception:\
+        rhs = float(ctx.get(token_r, 0.0) or 0.0)\
+\
+    if op == ">":\
+        return lhs > rhs\
+    if op == "<":\
+        return lhs < rhs\
+    if op == ">=":\
+        return lhs >= rhs\
+    if op == "<=":\
+        return lhs <= rhs\
+    if op == "==":\
+        return abs(lhs - rhs) < 1e-9\
+    if op == "!=":\
+        return abs(lhs - rhs) >= 1e-9\
+    return False\
+\
+\
+def eval_expr(expr: str, ctx: Dict[str, Any]) -> bool:\
+    """\
+    Safe evaluator for expressions like:\
+      "mean_delta_e > 2.5 and ghost_pass_rate < 0.8 or processing_time > 4"\
+    - No parentheses (kept simple); 'and' has higher precedence than 'or'.\
+    - Tokens must be identifiers present in ctx or numeric literals.\
+    """\
+    if not expr or not expr.strip():\
+        return False\
+\
+    # Tokenize by spaces, normalize case\
+    tokens = expr.strip().replace("AND", "and").replace("OR", "or").split()\
+    if not tokens:\
+        return False\
+\
+    # Split by 'or' into clauses; each clause is a series of ANDed comparisons\
+    or_clauses: List[List[str]] = []\
+    clause: List[str] = []\
+    for t in tokens:\
+        if t == "or":\
+            if clause:\
+                or_clauses.append(clause)\
+                clause = []\
+        else:\
+            clause.append(t)\
+    if clause:\
+        or_clauses.append(clause)\
+\
+    def eval_clause(toks: List[str]) -> bool:\
+        # Expect triplets: <metric> <op> <value> [and <metric> <op> <value>]*\
+        i = 0\
+        result: Optional[bool] = None\
+        while i < len(toks):\
+            if i + 2 >= len(toks):\
+                return False\
+            l, op, r = toks[i], toks[i+1], toks[i+2]\
+            ok = _eval_comparison(l, op, r, ctx)\
+            result = ok if result is None else (result and ok)\
+            i += 3\
+            # skip optional 'and'\
+            if i < len(toks) and toks[i] == "and":\
+                i += 1\
+        return bool(result)\
+\
+    return any(eval_clause(c) for c in or_clauses)\
+\
+\
+def suggest_overrides(metrics_ctx: Dict[str, Any], rules: List[Dict[str, Any]]) -> List[Dict[str, Any]]:\
+    patches: List[Dict[str, Any]] = []\
+    for r in rules:\
+        cond = r.get("when", "")\
+        if eval_expr(cond, metrics_ctx):\
+            for act in r.get("actions", []):\
+                # Examples:\
+                #   "step3.guidance_scale += 0.5"\
+                #   "step2.enforce_primary_hex = 1"\
+                #   "step3.use_depth = True"  (will be SET True)\
+                toks = act.split()\
+                if len(toks) == 3:\
+                    param, op, val = toks\
+                    try:\
+                        value: Any = float(val)\
+                    except Exception:\
+                        value = val\
+                    patches.append(\{"param": param, "op": op, "value": value\})\
+                elif len(toks) == 1:\
+                    patches.append(\{"param": toks[0], "op": "SET", "value": True\})\
+    return patches\
+\
+\
+# =========================\
+# Slack\
+# =========================\
+\
+def slack_notify(text: str, severity: str, webhook_url: Optional[str]) -> None:\
+    if not webhook_url or not HAVE_REQUESTS:\
+        return\
+    emoji = \{"OK": "\uc0\u9989 ", "WARN": "\u55357 \u57313 ", "CRITICAL": "\u55357 \u56628 "\}.get(severity, "\u8505 \u65039 ")\
+    payload = \{"text": f"\{emoji\} \{severity\} \'97 \{text\}"\}\
+    try:\
+        requests.post(webhook_url, json=payload, timeout=5)\
+    except Exception:\
+        # Silent failure by design (don\'92t leak webhook, don\'92t crash pipeline)\
+        pass\
+\
+\
+# =========================\
+# Metrics extraction & fusion\
+# =========================\
+\
+def extract_metrics(qa: Dict[str, Any],\
+                    manifest: Dict[str, Any],\
+                    provided_proc_time: Optional[float]) -> Dict[str, Any]:\
+    """\
+    Pulls metrics from QA; falls back to Step-5 manifest.qa_summary when useful.\
+    """\
+    # QA fields (Step 4)\
+    color = qa.get("color", qa.get("color_metrics", \{\}))\
+    mean_de = color.get("mean_delta_e", color.get("mean"))\
+    p95_de = color.get("p95_delta_e", color.get("p95"))\
+\
+    ghost = qa.get("ghost_quality", \{\})\
+    ghost_ok = bool(ghost.get("overall_hollow_quality", ghost.get("pass", True)))\
+\
+    label = qa.get("label_integrity", qa.get("brand_integrity", \{\}))\
+    label_ok = bool(label.get("overall_pass", label.get("readable", True)))\
+\
+    tech = qa.get("technical_validation", \{\})\
+    res_ok = bool(tech.get("resolution_pass", True))\
+    bg_ok = bool(tech.get("background_pass", True))\
+\
+    perc = qa.get("perceptual_quality", \{\})\
+    sharp = perc.get("sharpness") or perc.get("sharpness_var_laplacian")\
+    ssim = perc.get("ssim")\
+    lpips = perc.get("lpips")\
+\
+    # Fall back to manifest.qa_summary if missing\
+    mqa = manifest.get("qa_summary", \{\})\
+    if mean_de is None:\
+        mean_de = mqa.get("mean_delta_e")\
+    if p95_de is None:\
+        p95_de = mqa.get("p95_delta_e")\
+    if not ghost and "ghost_pass" in mqa:\
+        ghost_ok = bool(mqa.get("ghost_pass"))\
+    if "label_pass" in mqa:\
+        label_ok = bool(mqa.get("label_pass"))\
+\
+    # Single-run pass proxy\
+    single_pass = all([ghost_ok, label_ok, res_ok, bg_ok])\
+\
+    # Processing time: prefer provided argument; else if manifest has created_at and we have finished_at we\'92ll compute upstream.\
+    proc_time = provided_proc_time if provided_proc_time is not None else 3.0\
+\
+    return \{\
+        "mean_delta_e": float(mean_de) if mean_de is not None else 3.0,\
+        "p95_delta_e": float(p95_de) if p95_de is not None else 5.0,\
+        "ghost_pass_rate": 1.0 if ghost_ok else 0.0,\
+        "label_pass_rate": 1.0 if label_ok else 0.0,\
+        "overall_pass_rate": 1.0 if single_pass else 0.0,\
+        "sharpness": sharp,\
+        "ssim": ssim,\
+        "lpips": lpips,\
+        "processing_time": float(proc_time)\
+    \}\
+\
+\
+# =========================\
+# Rolling metrics (last N)\
+# =========================\
+\
+def rolling_pass_rate(kind: str, conn, sku: str, variant: str, window: int = 50) -> Optional[float]:\
+    """\
+    Approximate rolling pass rate for (sku, variant) over last N runs.\
+    We consider a pass when ghost_pass AND label_readable are True.\
+    """\
+    try:\
+        if kind == "postgres":\
+            cur = conn.cursor()\
+            cur.execute("""\
+                SELECT qm.ghost_pass, qm.label_readable\
+                FROM runs r\
+                JOIN qa_metrics qm ON qm.run_id = r.run_id\
+                WHERE r.sku=%s AND r.variant=%s\
+                ORDER BY r.started_at DESC\
+                LIMIT %s;\
+            """, (sku, variant, window))\
+            rows = cur.fetchall()\
+        else:\
+            cur = conn.cursor()\
+            cur.execute("""\
+                SELECT qm.ghost_pass, qm.label_readable\
+                FROM runs r\
+                JOIN qa_metrics qm ON qm.run_id = r.run_id\
+                WHERE r.sku = ? AND r.variant = ?\
+                ORDER BY r.started_at DESC\
+                LIMIT ?;\
+            """, (sku, variant, window))\
+            rows = cur.fetchall()\
+        if not rows:\
+            return None\
+        total = len(rows)\
+        ok = 0\
+        for g, l in rows:\
+            g_ok = bool(g)\
+            l_ok = bool(l)\
+            if g_ok and l_ok:\
+                ok += 1\
+        return ok / total if total else None\
+    except Exception:\
+        return None\
+\
+\
+# =========================\
+# CLI\
+# =========================\
+\
+def main():\
+    ap = argparse.ArgumentParser(description="Step 6: Feedback Engine \'97 score, store, alert, tune")\
+    ap.add_argument("--run-id", required=True, help="Unique run ID")\
+    ap.add_argument("--sku", required=True)\
+    ap.add_argument("--variant", required=True)\
+    ap.add_argument("--route", choices=["routeA", "routeB"], default="routeA", help="Renderer route")\
+    ap.add_argument("--template-id", default="photostudio_ghost_mannequin_v2")\
+    ap.add_argument("--qa", required=True, help="Path to qa_report.json (from step 4 or corrected)")\
+    ap.add_argument("--manifest", help="Path to delivery_manifest.json (from step 5)")\
+    ap.add_argument("--processing-time", type=float, help="Overall processing time (s)")\
+    ap.add_argument("--started-at", help="ISO timestamp start")\
+    ap.add_argument("--finished-at", help="ISO timestamp end (default now)")\
+    ap.add_argument("--targets-deltae", type=float, default=2.0, help="Target mean \uc0\u916 E")\
+    ap.add_argument("--targets-passrate", type=float, default=0.85, help="Target pass rate")\
+    ap.add_argument("--targets-time", type=float, default=3.0, help="Target time (s)")\
+    ap.add_argument("--db", default="./step6/feedback.db", help="SQLite path (ignored if DATABASE_URL Postgres provided)")\
+    ap.add_argument("--tuner-rules", default="./tuner_rules.yml", help="YAML rules file")\
+    ap.add_argument("--slack-webhook", help="Slack webhook URL (or env SLACK_WEBHOOK_URL)")\
+    ap.add_argument("--out", default="./step6", help="Output folder")\
+    ap.add_argument("--rolling-window", type=int, default=50, help="Window size for rolling pass-rate (per SKU/variant)")\
+    args = ap.parse_args()\
+\
+    out_dir = Path(args.out)\
+    out_dir.mkdir(parents=True, exist_ok=True)\
+\
+    qa = read_json(Path(args.qa))\
+    manifest = read_json(Path(args.manifest)) if args.manifest else \{\}\
+\
+    # Determine timestamps and processing time\
+    started_at = args.started_at or manifest.get("created_at") or _now_iso()\
+    finished_at = args.finished_at or _now_iso()\
+    measured = _seconds_between(started_at, finished_at)\
+    proc_time = float(args.processing_time) if args.processing_time is not None else (measured if measured is not None else 3.0)\
+\
+    # Open DB & ensure schema\
+    kind, conn = open_db(args.db)\
+    init_schema(kind, conn)\
+\
+    # Extract metrics (fusing QA & manifest), using computed proc_time\
+    metrics = extract_metrics(qa, manifest, proc_time)\
+\
+    # Rolling pass rate (if historical data available)\
+    roll = rolling_pass_rate(kind, conn, args.sku, args.variant, window=args.rolling_window)\
+    pass_rate_for_score = roll if roll is not None else metrics["overall_pass_rate"]\
+\
+    # Composite score & severity\
+    score = health_score(\
+        metrics["mean_delta_e"],\
+        pass_rate_for_score,\
+        metrics["processing_time"],\
+        targets=(args.targets_deltae, args.targets_passrate, args.targets_time)\
+    )\
+    severity = severity_from_score(score)\
+\
+    # Build context for tuner\
+    metrics_ctx = \{\
+        "mean_delta_e": float(metrics["mean_delta_e"]),\
+        "p95_delta_e": float(metrics["p95_delta_e"]),\
+        "ghost_pass_rate": float(metrics["ghost_pass_rate"]),\
+        "label_pass_rate": float(metrics["label_pass_rate"]),\
+        "overall_pass_rate": float(pass_rate_for_score),\
+        "processing_time": float(metrics["processing_time"]),\
+    \}\
+    rules = load_rules(Path(args.tuner_rules))\
+    suggestions = suggest_overrides(metrics_ctx, rules)\
+\
+    # Persist run + metrics\
+    session_id = manifest.get("analysis_excerpt", \{\}).get("template_id")\
+    if kind == "postgres":\
+        cur = conn.cursor()\
+        # Upsert runs (update finished_at if exists)\
+        cur.execute("""\
+            INSERT INTO runs (run_id, session_id, sku, variant, template_id, route, started_at, finished_at)\
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)\
+            ON CONFLICT (run_id) DO UPDATE SET\
+                session_id = EXCLUDED.session_id,\
+                sku = EXCLUDED.sku,\
+                variant = EXCLUDED.variant,\
+                template_id = EXCLUDED.template_id,\
+                route = EXCLUDED.route,\
+                started_at = EXCLUDED.started_at,\
+                finished_at = EXCLUDED.finished_at;\
+        """, (args.run_id, session_id, args.sku, args.variant, args.template_id, args.route, started_at, finished_at))\
+        cur.execute("""\
+            INSERT INTO qa_metrics (run_id, mean_delta_e, p95_delta_e, ghost_pass, label_readable, sharpness, ssim, lpips)\
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)\
+            ON CONFLICT (run_id) DO UPDATE SET\
+                mean_delta_e=EXCLUDED.mean_delta_e,\
+                p95_delta_e=EXCLUDED.p95_delta_e,\
+                ghost_pass=EXCLUDED.ghost_pass,\
+                label_readable=EXCLUDED.label_readable,\
+                sharpness=EXCLUDED.sharpness,\
+                ssim=EXCLUDED.ssim,\
+                lpips=EXCLUDED.lpips;\
+        """, (args.run_id, metrics["mean_delta_e"], metrics["p95_delta_e"],\
+              metrics["ghost_pass_rate"] >= 1.0, metrics["label_pass_rate"] >= 1.0,\
+              metrics.get("sharpness"), metrics.get("ssim"), metrics.get("lpips")))\
+        conn.commit()\
+    else:\
+        cur = conn.cursor()\
+        cur.execute("""\
+            INSERT OR REPLACE INTO runs (run_id, session_id, sku, variant, template_id, route, started_at, finished_at)\
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?);\
+        """, (args.run_id, session_id, args.sku, args.variant, args.template_id, args.route, started_at, finished_at))\
+        cur.execute("""\
+            INSERT OR REPLACE INTO qa_metrics (run_id, mean_delta_e, p95_delta_e, ghost_pass, label_readable, sharpness, ssim, lpips)\
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?);\
+        """, (args.run_id, metrics["mean_delta_e"], metrics["p95_delta_e"],\
+              int(metrics["ghost_pass_rate"] >= 1.0), int(metrics["label_pass_rate"] >= 1.0),\
+              metrics.get("sharpness"), metrics.get("ssim"), metrics.get("lpips")))\
+        conn.commit()\
+\
+    # Persist tuning suggestions\
+    if suggestions:\
+        if kind == "postgres":\
+            cur = conn.cursor()\
+            for i, s in enumerate(suggestions, start=1):\
+                event_id = f"\{args.run_id\}:\{i\}"\
+                cur.execute("""\
+                    INSERT INTO tuning_events (event_id, run_id, param, reason)\
+                    VALUES (%s,%s,%s,%s)\
+                    ON CONFLICT (event_id) DO NOTHING;\
+                """, (event_id, args.run_id, Json(s), f"rule match for \{s['param']\}"))\
+            conn.commit()\
+        else:\
+            cur = conn.cursor()\
+            now_iso = _now_iso()\
+            for i, s in enumerate(suggestions, start=1):\
+                event_id = f"\{args.run_id\}:\{i\}"\
+                cur.execute("""\
+                    INSERT OR IGNORE INTO tuning_events (event_id, run_id, param, reason, created_at)\
+                    VALUES (?,?,?,?,?);\
+                """, (event_id, args.run_id, json.dumps(s), f"rule match for \{s['param']\}", now_iso))\
+            conn.commit()\
+\
+    # Slack alert (short + useful)\
+    slack_notify(\
+        text=f"Run \{args.run_id\} \'97 Health \{score:.2f\} | mean\uc0\u916 E=\{metrics['mean_delta_e']:.2f\}, pass=\{pass_rate_for_score:.2f\}, time=\{metrics['processing_time']:.2f\}s",\
+        severity=severity,\
+        webhook_url=(args.slack_webhook or os.getenv("SLACK_WEBHOOK_URL"))\
+    )\
+\
+    # Feedback summary (write to file)\
+    summary = \{\
+        "run_id": args.run_id,\
+        "sku": args.sku,\
+        "variant": args.variant,\
+        "route": args.route,\
+        "template_id": args.template_id,\
+        "started_at": started_at,\
+        "finished_at": finished_at,\
+        "metrics": metrics,\
+        "rolling_pass_rate": None if roll is None else round(roll, 4),\
+        "health_score": round(score, 3),\
+        "severity": severity,\
+        "tuning_suggestions": suggestions\
+    \}\
+    out_path = out_dir / "feedback_summary.json"\
+    out_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")\
+\
+    # CLI summary (no secrets)\
+    print("\uc0\u9989  Step 6 complete.")\
+    print(f"Health:   \{score:.3f\} (\{severity\})")\
+    print(f"Summary:  \{out_path\}")\
+    print(f"DB:       \{'Postgres (env)' if kind=='postgres' else Path(args.db)\}")\
+    if suggestions:\
+        print(f"Suggestions (\{len(suggestions)\}):")\
+        for s in suggestions:\
+            print(f"  - \{s['param']\} \{s['op']\} \{s['value']\}")\
+\
+    # Close DB\
+    try:\
+        conn.close()\
+    except Exception:\
+        pass\
+\
+\
+if __name__ == "__main__":\
+    main()}

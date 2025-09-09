@@ -1,0 +1,573 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2822
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fnil\fcharset0 .SFNS-Regular;\f1\fnil\fcharset0 .AppleSystemUIFontMonospaced-Regular;\f2\fnil\fcharset0 HelveticaNeue-Bold;
+\f3\fswiss\fcharset0 Helvetica;\f4\fmodern\fcharset0 Courier-Oblique;\f5\fmodern\fcharset0 Courier;
+\f6\fnil\fcharset0 .SFNS-Semibold;}
+{\colortbl;\red255\green255\blue255;\red14\green14\blue14;\red74\green80\blue93;\red155\green162\blue177;
+\red136\green185\blue102;\red184\green93\blue213;\red197\green136\blue83;\red72\green168\blue181;\red214\green85\blue98;
+\red81\green156\blue233;}
+{\*\expandedcolortbl;;\cssrgb\c6700\c6700\c6700;\cssrgb\c36078\c38824\c43922;\cssrgb\c67059\c69804\c74902;
+\cssrgb\c59608\c76471\c47451;\cssrgb\c77647\c47059\c86667;\cssrgb\c81961\c60392\c40000;\cssrgb\c33725\c71373\c76078;\cssrgb\c87843\c42353\c45882;
+\cssrgb\c38039\c68235\c93333;}
+\paperw11900\paperh16840\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\sl324\slmult1\pardirnatural\partightenfactor0
+
+\f0\fs28 \cf2 Absolutely. Your Step-5 script is close, but it has a few rough edges (indentation/typing glitches, brittle ICC handling, hard-coded sizes, minimal manifest, weak S3 metadata). Below is a refined, production-oriented 
+\f1 \cf2 step5_delivery_engine.py
+\f0 \cf2  that:\
+\pard\tqr\tx100\tx260\li260\fi-260\sl324\slmult1\sb240\partightenfactor0
+\cf2 	\'95	embeds an sRGB ICC profile for 
+\f2\b PNG/WebP/AVIF
+\f0\b0  (if 
+\f1 \cf2 ImageCms
+\f0 \cf2  available),\
+	\'95	generates 
+\f2\b content-addressable names
+\f0\b0  from a SHA-256 of the 
+\f2\b master PNG bytes
+\f0\b0 ,\
+	\'95	makes 
+\f2\b sizes configurable
+\f0\b0  (
+\f1 \cf2 --web-sizes 2048,1024,512,384
+\f0 \cf2 ) with optional 
+\f2\b lossless WebP
+\f0\b0 ,\
+	\'95	optionally emits 
+\f2\b AVIF
+\f0\b0  if the plugin is present (graceful fallback),\
+	\'95	writes a rich 
+\f2\b delivery_manifest.json
+\f0\b0  (sizes, sha256, bytes, URLs, QA summary, accessibility),\
+	\'95	does 
+\f2\b immutable
+\f0\b0  S3 uploads with the correct 
+\f2\b Content-Type
+\f0\b0  and 
+\f2\b Cache-Control
+\f0\b0 ,\
+	\'95	is deterministic and has clearer logging & errors.\
+\pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\pardirnatural\partightenfactor0
+
+\f3\fs24 \cf0 \
+\uc0\u11835 \
+\
+\
+\pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\pardirnatural\partightenfactor0
+
+\f4\i\fs28 \cf3 #!/usr/bin/env python3
+\f5\i0 \cf4 \
+
+\f4\i \cf3 # -*- coding: utf-8 -*-
+\f5\i0 \cf4 \
+\pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\pardirnatural\partightenfactor0
+\cf5 """\
+step5_delivery_engine.py\
+Step 5/6 \'97 Package & Publish (master+variants, manifest, optional S3 upload)\
+\
+Usage (example):\
+  python step5_delivery_engine.py \\\
+    --final ./step4/final.png \\\
+    --qa ./step4/qa_report.json \\\
+    --json ./step1/garment_analysis.json \\\
+    --sku ABC123 \\\
+    --variant navy \\\
+    --version 2.0.0 \\\
+    --out ./step5 \\\
+    --emit-avif \\\
+    --web-sizes 2048,1024,512,384 \\\
+    --webp-lossless \\\
+    --s3-bucket my-bucket \\\
+    --s3-prefix products \\\
+    --public-base-url https://cdn.example.com\
+\
+Requires: Pillow; optional: Pillow ImageCms (for ICC), pillow-avif-plugin (AVIF), boto3 (S3).\
+"""\cf4 \
+\
+\cf6 from\cf4  __future__ \cf6 import\cf4  annotations\
+\
+\cf6 import\cf4  argparse\
+\cf6 import\cf4  hashlib\
+\cf6 import\cf4  json\
+\cf6 import\cf4  mimetypes\
+\cf6 import\cf4  os\
+\cf6 import\cf4  sys\
+\cf6 import\cf4  time\
+\cf6 from\cf4  dataclasses \cf6 import\cf4  dataclass\
+\cf6 from\cf4  datetime \cf6 import\cf4  datetime\
+\cf6 from\cf4  pathlib \cf6 import\cf4  Path\
+\cf6 from\cf4  typing \cf6 import\cf4  \cf7 Dict\cf4 , \cf7 List\cf4 , \cf7 Optional\cf4 , \cf7 Tuple\cf4 \
+\
+\cf6 from\cf4  PIL \cf6 import\cf4  Image\
+\
+\pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\pardirnatural\partightenfactor0
+
+\f4\i \cf3 # ---------------- Optional deps (graceful fallbacks) ----------------
+\f5\i0 \cf4 \
+\pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\pardirnatural\partightenfactor0
+\cf6 try\cf4 :\
+    \cf6 from\cf4  PIL \cf6 import\cf4  ImageCms  
+\f4\i \cf3 # type: ignore
+\f5\i0 \cf4 \
+    HAVE_IMAGECMS = \cf8 True\cf4 \
+\cf6 except\cf4  Exception:\
+    HAVE_IMAGECMS = \cf8 False\cf4 \
+\
+\pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\pardirnatural\partightenfactor0
+
+\f4\i \cf3 # pillow-avif-plugin is usually imported as pillow_avif
+\f5\i0 \cf4 \
+\pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\pardirnatural\partightenfactor0
+\cf6 try\cf4 :\
+    \cf6 import\cf4  pillow_avif  
+\f4\i \cf3 # noqa: F401
+\f5\i0 \cf4 \
+    HAVE_AVIF = \cf8 True\cf4 \
+\cf6 except\cf4  Exception:\
+    HAVE_AVIF = \cf8 False\cf4 \
+\
+\cf6 try\cf4 :\
+    \cf6 import\cf4  boto3  
+\f4\i \cf3 # only needed for S3
+\f5\i0 \cf4 \
+    HAVE_BOTO3 = \cf8 True\cf4 \
+\cf6 except\cf4  Exception:\
+    HAVE_BOTO3 = \cf8 False\cf4 \
+\
+\
+\pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\pardirnatural\partightenfactor0
+
+\f4\i \cf3 # ---------------- Utilities ----------------
+\f5\i0 \cf4 \
+\pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\pardirnatural\partightenfactor0
+\cf6 def\cf4  sha256_bytes(b: bytes) -> str:\
+    \cf6 return\cf4  hashlib.sha256(b).hexdigest()\
+\
+\
+\cf6 def\cf4  now_iso() -> str:\
+    \cf6 return\cf4  datetime.utcnow().isoformat(timespec=\cf5 "seconds"\cf4 ) + \cf5 "Z"\cf4 \
+\
+\
+\cf6 def\cf4  log(msg: str) -> \cf8 None\cf4 :\
+    print(msg, file=sys.stderr)\
+\
+\
+\cf6 def\cf4  read_json(path: Path) -> dict:\
+    \cf6 try\cf4 :\
+        \cf6 return\cf4  json.loads(path.read_text(encoding=\cf5 "utf-8"\cf4 ))\
+    \cf6 except\cf4  Exception:\
+        \cf6 return\cf4  \{\}\
+\
+\
+\cf6 def\cf4  parse_sizes(arg: str) -> \cf7 List\cf4 [int]:\
+    \cf6 try\cf4 :\
+        sizes = [int(x.strip()) \cf6 for\cf4  x \cf6 in\cf4  arg.split(\cf5 ","\cf4 ) \cf6 if\cf4  x.strip()]\
+        sizes = [s \cf6 for\cf4  s \cf6 in\cf4  sizes \cf6 if\cf4  s > \cf7 0\cf4 ]\
+        \cf6 if\cf4  \cf6 not\cf4  sizes:\
+            \cf6 raise\cf4  ValueError\
+        \cf6 return\cf4  sizes\
+    \cf6 except\cf4  Exception:\
+        \cf6 raise\cf4  argparse.ArgumentTypeError(\cf5 "Invalid --web-sizes. Example: 2048,1024,512,384"\cf4 )\
+\
+\
+\cf6 def\cf4  ensure_square(im: Image.Image, side: int) -> Image.Image:\
+    \cf5 """Pad to square then resize to target side."""\cf4 \
+    w, h = im.size\
+    s = max(w, h)\
+    bg_color = (\cf7 255\cf4 , \cf7 255\cf4 , \cf7 255\cf4 , \cf7 0\cf4 ) \cf6 if\cf4  im.mode == \cf5 "RGBA"\cf4  \cf6 else\cf4  (\cf7 255\cf4 , \cf7 255\cf4 , \cf7 255\cf4 )\
+    canvas_mode = \cf5 "RGBA"\cf4  \cf6 if\cf4  im.mode == \cf5 "RGBA"\cf4  \cf6 else\cf4  \cf5 "RGB"\cf4 \
+    canvas = Image.new(canvas_mode, (s, s), bg_color)\
+    canvas.paste(im, ((s - w) // \cf7 2\cf4 , (s - h) // \cf7 2\cf4 ))\
+    \cf6 if\cf4  s != side:\
+        canvas = canvas.resize((side, side), Image.LANCZOS)\
+    \cf6 return\cf4  canvas\
+\
+\
+\cf6 def\cf4  make_srgb_icc_bytes() -> \cf7 Optional\cf4 [bytes]:\
+    \cf6 if\cf4  \cf6 not\cf4  HAVE_IMAGECMS:\
+        \cf6 return\cf4  \cf8 None\cf4 \
+    \cf6 try\cf4 :\
+        prof = ImageCms.createProfile(\cf5 "sRGB"\cf4 )\
+        \cf6 return\cf4  ImageCms.ImageCmsProfile(prof).tobytes()\
+    \cf6 except\cf4  Exception:\
+        \cf6 return\cf4  \cf8 None\cf4 \
+\
+\
+\cf6 def\cf4  embed_icc(img: Image.Image, icc_bytes: \cf7 Optional\cf4 [bytes]) -> \cf7 Tuple\cf4 [Image.Image, \cf7 Optional\cf4 [bytes]]:\
+    \cf5 """Return (image, icc_bytes). Ensures icc_bytes available and attached in image.info if possible."""\cf4 \
+    \cf6 if\cf4  icc_bytes \cf6 is\cf4  \cf8 None\cf4 :\
+        icc_bytes = make_srgb_icc_bytes()\
+    \cf6 if\cf4  icc_bytes:\
+        img.info[\cf5 "icc_profile"\cf4 ] = icc_bytes  
+\f4\i \cf3 # type: ignore[index]
+\f5\i0 \cf4 \
+    \cf6 return\cf4  img, icc_bytes\
+\
+\
+\cf6 def\cf4  guess_mime(path: Path) -> str:\
+    ctype, _ = mimetypes.guess_type(path.as_posix())\
+    \cf6 if\cf4  ctype:\
+        \cf6 return\cf4  ctype\
+    s = path.suffix.lower()\
+    \cf6 if\cf4  s == \cf5 ".webp"\cf4 :\
+        \cf6 return\cf4  \cf5 "image/webp"\cf4 \
+    \cf6 if\cf4  s == \cf5 ".png"\cf4 :\
+        \cf6 return\cf4  \cf5 "image/png"\cf4 \
+    \cf6 if\cf4  s == \cf5 ".avif"\cf4 :\
+        \cf6 return\cf4  \cf5 "image/avif"\cf4 \
+    \cf6 return\cf4  \cf5 "application/octet-stream"\cf4 \
+\
+\
+\cf6 def\cf4  content_addressable_stem(sku: str, variant: str, semver: str, content_hash: str) -> str:\
+    \cf5 """\
+    File-system & URL friendly stem. Avoid '*' in names (problematic in shells/URLs).\
+    """\cf4 \
+    \cf6 return\cf4  \cf5 f"\cf9 \{sku\}\cf5 __\cf9 \{variant\}\cf5 __v\cf9 \{semver\}\cf5 __\cf9 \{content_hash[:\cf7 10\cf9 ]\}\cf5 "\cf4 \
+\
+\
+\cf6 def\cf4  save_master_png(img: Image.Image, out_dir: Path, base_stem: str, icc: \cf7 Optional\cf4 [bytes]) -> Path:\
+    out_dir.mkdir(parents=\cf8 True\cf4 , exist_ok=\cf8 True\cf4 )\
+    p = out_dir / \cf5 f"\cf9 \{base_stem\}\cf5 .png"\cf4 \
+    save_kwargs = dict(format=\cf5 "PNG"\cf4 , optimize=\cf8 True\cf4 , compress_level=\cf7 9\cf4 )\
+    \cf6 if\cf4  icc:\
+        save_kwargs[\cf5 "icc_profile"\cf4 ] = icc  
+\f4\i \cf3 # type: ignore[assignment]
+\f5\i0 \cf4 \
+    img.save(p, **save_kwargs)\
+    \cf6 return\cf4  p\
+\
+\
+\cf6 def\cf4  save_webp_variants(\
+    img: Image.Image, out_dir: Path, base_stem: str, sizes: \cf7 List\cf4 [int], icc: \cf7 Optional\cf4 [bytes], lossless: bool\
+) -> \cf7 List\cf4 [Path]:\
+    out_dir.mkdir(parents=\cf8 True\cf4 , exist_ok=\cf8 True\cf4 )\
+    paths: \cf7 List\cf4 [Path] = []\
+    \cf6 for\cf4  size \cf6 in\cf4  sizes:\
+        \cf6 if\cf4  size <= \cf7 0\cf4 :\
+            \cf6 continue\cf4 \
+        imr = img.resize((size, size), Image.LANCZOS) \cf6 if\cf4  img.size != (size, size) \cf6 else\cf4  img\
+        outfile = out_dir / \cf5 f"\cf9 \{base_stem\}\cf5 _\cf9 \{size\}\cf5 .webp"\cf4 \
+        save_kwargs = dict(format=\cf5 "WEBP"\cf4 , method=\cf7 6\cf4 , quality=\cf7 100\cf4  \cf6 if\cf4  lossless \cf6 else\cf4  \cf7 90\cf4 , lossless=lossless)\
+        \cf6 if\cf4  icc:\
+            save_kwargs[\cf5 "icc_profile"\cf4 ] = icc  
+\f4\i \cf3 # type: ignore[assignment]
+\f5\i0 \cf4 \
+        imr.save(outfile, **save_kwargs)\
+        paths.append(outfile)\
+    \cf6 return\cf4  paths\
+\
+\
+\cf6 def\cf4  try_save_avif(img: Image.Image, out_dir: Path, base_stem: str, icc: \cf7 Optional\cf4 [bytes]) -> \cf7 Optional\cf4 [Path]:\
+    \cf6 if\cf4  \cf6 not\cf4  HAVE_AVIF:\
+        \cf6 return\cf4  \cf8 None\cf4 \
+    out_dir.mkdir(parents=\cf8 True\cf4 , exist_ok=\cf8 True\cf4 )\
+    \cf6 try\cf4 :\
+        p = out_dir / \cf5 f"\cf9 \{base_stem\}\cf5 _2048.avif"\cf4 \
+        save_kwargs = dict(format=\cf5 "AVIF"\cf4 , quality=\cf7 45\cf4 )\
+        \cf6 if\cf4  icc:\
+            save_kwargs[\cf5 "icc_profile"\cf4 ] = icc  
+\f4\i \cf3 # type: ignore[assignment]
+\f5\i0 \cf4 \
+        
+\f4\i \cf3 # Ensure 2048x2048 master for AVIF too
+\f5\i0 \cf4 \
+        imr = img.resize((\cf7 2048\cf4 , \cf7 2048\cf4 ), Image.LANCZOS) \cf6 if\cf4  img.size != (\cf7 2048\cf4 , \cf7 2048\cf4 ) \cf6 else\cf4  img\
+        imr.save(p, **save_kwargs)\
+        \cf6 return\cf4  p\
+    \cf6 except\cf4  Exception:\
+        \cf6 return\cf4  \cf8 None\cf4 \
+\
+\
+\cf6 def\cf4  gate_from_qa(qa: dict, delta_e_gate: float) -> dict:\
+    \cf5 """\
+    Tolerant extractor for Step-4 QA JSON shapes.\
+    """\cf4 \
+    color = qa.get(\cf5 "color_metrics"\cf4 , qa.get(\cf5 "color"\cf4 , \{\})) \cf6 or\cf4  \{\}\
+    mean_de = color.get(\cf5 "mean_delta_e"\cf4 )\
+    p95_de = color.get(\cf5 "p95_delta_e"\cf4 )\
+    ghost = qa.get(\cf5 "ghost_quality"\cf4 , \{\}) \cf6 or\cf4  \{\}\
+    label = qa.get(\cf5 "label_integrity"\cf4 , qa.get(\cf5 "brand_integrity"\cf4 , \{\})) \cf6 or\cf4  \{\}\
+    tech = qa.get(\cf5 "technical_validation"\cf4 , \{\}) \cf6 or\cf4  \{\}\
+\
+    ghost_ok = bool(ghost.get(\cf5 "overall_hollow_quality"\cf4 , ghost.get(\cf5 "pass"\cf4 , \cf8 True\cf4 )))\
+    label_ok = bool(label.get(\cf5 "overall_pass"\cf4 , label.get(\cf5 "readable"\cf4 , \cf8 True\cf4 )))\
+    label_contrast = label.get(\cf5 "contrast_ratio"\cf4 )\
+    res_ok = bool(tech.get(\cf5 "resolution_pass"\cf4 , \cf8 True\cf4 ))\
+    bg_ok = bool(tech.get(\cf5 "background_pass"\cf4 , \cf8 True\cf4 ))\
+\
+    strict_color_pass = (mean_de \cf6 is\cf4  \cf8 None\cf4 ) \cf6 or\cf4  (float(mean_de) <= float(delta_e_gate))\
+    acceptable_color_pass = (p95_de \cf6 is\cf4  \cf8 None\cf4 ) \cf6 or\cf4  (float(p95_de) <= float(delta_e_gate) * \cf7 2.0\cf4 )\
+\
+    overall = all([strict_color_pass, acceptable_color_pass, ghost_ok, label_ok, res_ok, bg_ok])\
+\
+    \cf6 return\cf4  \{\
+        \cf5 "mean_delta_e"\cf4 : mean_de,\
+        \cf5 "p95_delta_e"\cf4 : p95_de,\
+        \cf5 "strict_color_pass"\cf4 : strict_color_pass,\
+        \cf5 "acceptable_color_pass"\cf4 : acceptable_color_pass,\
+        \cf5 "ghost_pass"\cf4 : ghost_ok,\
+        \cf5 "label_pass"\cf4 : label_ok,\
+        \cf5 "label_contrast_ratio"\cf4 : label_contrast,\
+        \cf5 "resolution_pass"\cf4 : res_ok,\
+        \cf5 "background_pass"\cf4 : bg_ok,\
+        \cf5 "overall_pass"\cf4 : overall,\
+    \}\
+\
+\
+\cf6 def\cf4  upload_s3(local_path: Path, bucket: str, key: str, public_base_url: \cf7 Optional\cf4 [str]) -> \cf7 Dict\cf4 [str, str]:\
+    \cf6 if\cf4  \cf6 not\cf4  HAVE_BOTO3:\
+        \cf6 raise\cf4  RuntimeError(\cf5 "boto3 not installed. pip install boto3 or omit --s3-bucket."\cf4 )\
+    s3 = boto3.client(\cf5 "s3"\cf4 )\
+    ctype = guess_mime(local_path)\
+    s3.upload_file(\
+        Filename=str(local_path),\
+        Bucket=bucket,\
+        Key=key,\
+        ExtraArgs=\{\
+            \cf5 "ContentType"\cf4 : ctype,\
+            \cf5 "CacheControl"\cf4 : \cf5 "public, max-age=31536000, immutable"\cf4 ,\
+        \},\
+    )\
+    out = \{\cf5 "s3_uri"\cf4 : \cf5 f"s3://\cf9 \{bucket\}\cf5 /\cf9 \{key\}\cf5 "\cf4 \}\
+    \cf6 if\cf4  public_base_url:\
+        out[\cf5 "url"\cf4 ] = \cf5 f"\cf9 \{public_base_url.rstrip(\cf5 '/'\cf9 )\}\cf5 /\cf9 \{key\}\cf5 "\cf4 \
+    \cf6 return\cf4  out\
+\
+\
+\cf6 def\cf4  file_facts(p: Path) -> \cf7 Dict\cf4 [str, int]:\
+    \cf6 try\cf4 :\
+        \cf6 with\cf4  Image.open(p) \cf6 as\cf4  im:\
+            w, h = im.size\
+    \cf6 except\cf4  Exception:\
+        w = h = \cf7 0\cf4 \
+    \cf6 try\cf4 :\
+        b = p.stat().st_size\
+    \cf6 except\cf4  Exception:\
+        b = \cf7 0\cf4 \
+    \cf6 return\cf4  \{\cf5 "width"\cf4 : int(w), \cf5 "height"\cf4 : int(h), \cf5 "bytes"\cf4 : int(b)\}\
+\
+\
+\pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\pardirnatural\partightenfactor0
+
+\f4\i \cf3 # ---------------- Manifest model ----------------
+\f5\i0 \cf4 \
+\pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\pardirnatural\partightenfactor0
+\cf10 @dataclass\cf4 \
+\pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\pardirnatural\partightenfactor0
+\cf6 class\cf4  ManifestPaths:\
+    master: str\
+    web: \cf7 List\cf4 [str]\
+    avif: \cf7 Optional\cf4 [str]\
+\
+\
+\pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\pardirnatural\partightenfactor0
+
+\f4\i \cf3 # ---------------- CLI ----------------
+\f5\i0 \cf4 \
+\pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\pardirnatural\partightenfactor0
+\cf6 def\cf4  main() -> \cf8 None\cf4 :\
+    ap = argparse.ArgumentParser(description=\cf5 "Step 5: Package & Publish"\cf4 )\
+    ap.add_argument(\cf5 "--final"\cf4 , required=\cf8 True\cf4 , help=\cf5 "Path to final image from Step 4 (PNG/WebP/etc.)"\cf4 )\
+    ap.add_argument(\cf5 "--qa"\cf4 , required=\cf8 True\cf4 , help=\cf5 "Path to qa_report.json from Step 4"\cf4 )\
+    ap.add_argument(\cf5 "--json"\cf4 , required=\cf8 True\cf4 , help=\cf5 "Path to Step 1 garment_analysis.json"\cf4 )\
+    ap.add_argument(\cf5 "--sku"\cf4 , required=\cf8 True\cf4 )\
+    ap.add_argument(\cf5 "--variant"\cf4 , required=\cf8 True\cf4 )\
+    ap.add_argument(\cf5 "--version"\cf4 , default=\cf5 "2.0.0"\cf4 , help=\cf5 "Semantic version tag"\cf4 )\
+    ap.add_argument(\cf5 "--out"\cf4 , default=\cf5 "./step5"\cf4 , help=\cf5 "Output root directory"\cf4 )\
+\
+    ap.add_argument(\cf5 "--master-size"\cf4 , type=int, default=\cf7 2048\cf4 , help=\cf5 "Square master size. Default: 2048"\cf4 )\
+    ap.add_argument(\cf5 "--web-sizes"\cf4 , type=parse_sizes, default=[\cf7 2048\cf4 , \cf7 1024\cf4 , \cf7 512\cf4 , \cf7 384\cf4 ],\
+                    help=\cf5 "Comma-separated square sizes for WebP. Default: 2048,1024,512,384"\cf4 )\
+    ap.add_argument(\cf5 "--webp-lossless"\cf4 , action=\cf5 "store_true"\cf4 , help=\cf5 "Save WebP as lossless (quality=100)."\cf4 )\
+    ap.add_argument(\cf5 "--emit-avif"\cf4 , action=\cf5 "store_true"\cf4 , help=\cf5 "Also emit AVIF (requires pillow-avif-plugin)"\cf4 )\
+\
+    ap.add_argument(\cf5 "--quality-gate-delta-e"\cf4 , type=float, default=\cf7 2.0\cf4 )\
+    ap.add_argument(\cf5 "--no-fail"\cf4 , action=\cf5 "store_true"\cf4 , help=\cf5 "Do not exit non-zero on gate failure"\cf4 )\
+\
+    
+\f4\i \cf3 # S3 / CDN
+\f5\i0 \cf4 \
+    ap.add_argument(\cf5 "--s3-bucket"\cf4 , help=\cf5 "Upload results to S3 bucket"\cf4 )\
+    ap.add_argument(\cf5 "--s3-prefix"\cf4 , default=\cf5 ""\cf4 , help=\cf5 "S3 key prefix, e.g., products/"\cf4 )\
+    ap.add_argument(\cf5 "--public-base-url"\cf4 , help=\cf5 "Public base URL for CDN (included in manifest)"\cf4 )\
+\
+    args = ap.parse_args()\
+\
+    out_root = Path(args.out)\
+    master_dir = out_root / \cf5 "master"\cf4 \
+    web_dir = out_root / \cf5 "web"\cf4 \
+    manif_dir = out_root / \cf5 "manifests"\cf4 \
+    \cf6 for\cf4  d \cf6 in\cf4  (master_dir, web_dir, manif_dir):\
+        d.mkdir(parents=\cf8 True\cf4 , exist_ok=\cf8 True\cf4 )\
+\
+    final_path = Path(args.final)\
+    \cf6 try\cf4 :\
+        
+\f4\i \cf3 # Keep alpha if present; otherwise RGB
+\f5\i0 \cf4 \
+        im = Image.open(final_path)\
+        \cf6 if\cf4  im.mode \cf6 not\cf4  \cf6 in\cf4  (\cf5 "RGB"\cf4 , \cf5 "RGBA"\cf4 ):\
+            im = im.convert(\cf5 "RGBA"\cf4  \cf6 if\cf4  im.mode.endswith(\cf5 "A"\cf4 ) \cf6 else\cf4  \cf5 "RGB"\cf4 )\
+    \cf6 except\cf4  Exception \cf6 as\cf4  e:\
+        log(\cf5 f"[ERROR] Cannot load final image: \cf9 \{e\}\cf5 "\cf4 )\
+        sys.exit(\cf7 2\cf4 )\
+\
+    
+\f4\i \cf3 # Prepare master canvas (square, master-size) and embed sRGB ICC
+\f5\i0 \cf4 \
+    im = ensure_square(im, args.master_size)\
+    im, icc_bytes = embed_icc(im, \cf8 None\cf4 )\
+\
+    
+\f4\i \cf3 # Compute content hash from the exact master PNG bytes
+\f5\i0 \cf4 \
+    tmp = master_dir / \cf5 "_tmp_master_hash.png"\cf4 \
+    im.save(tmp, format=\cf5 "PNG"\cf4 , optimize=\cf8 True\cf4 , compress_level=\cf7 9\cf4 , icc_profile=icc_bytes \cf6 if\cf4  icc_bytes \cf6 else\cf4  \cf8 None\cf4 )\
+    content_hash = sha256_bytes(tmp.read_bytes())\
+    \cf6 try\cf4 :\
+        tmp.unlink()\
+    \cf6 except\cf4  Exception:\
+        \cf6 pass\cf4 \
+\
+    base_stem = content_addressable_stem(args.sku, args.variant, args.version, content_hash)\
+\
+    
+\f4\i \cf3 # Save MASTER + variants
+\f5\i0 \cf4 \
+    master_png = save_master_png(im, master_dir, base_stem, icc_bytes)\
+    web_paths = save_webp_variants(im, web_dir, base_stem, args.web_sizes, icc_bytes, args.webp_lossless)\
+    avif_path: \cf7 Optional\cf4 [Path] = \cf8 None\cf4 \
+    \cf6 if\cf4  args.emit_avif:\
+        \cf6 if\cf4  \cf6 not\cf4  HAVE_AVIF:\
+            log(\cf5 "[WARN] AVIF plugin not available; skipping AVIF."\cf4 )\
+        \cf6 else\cf4 :\
+            avif_path = try_save_avif(im, web_dir, base_stem, icc_bytes)\
+\
+    
+\f4\i \cf3 # QA & analysis
+\f5\i0 \cf4 \
+    qa = read_json(Path(args.qa))\
+    analysis = read_json(Path(args.json))\
+    gate = gate_from_qa(qa, args.quality_gate_delta_e)\
+\
+    
+\f4\i \cf3 # Optional S3 upload
+\f5\i0 \cf4 \
+    uploads = []\
+    \cf6 if\cf4  args.s3_bucket:\
+        \cf6 if\cf4  \cf6 not\cf4  HAVE_BOTO3:\
+            log(\cf5 "[WARN] boto3 not available; skipping upload."\cf4 )\
+        \cf6 else\cf4 :\
+            key_root = (args.s3_prefix \cf6 or\cf4  \cf5 ""\cf4 ).strip(\cf5 "/"\cf4 )\
+            \cf6 if\cf4  key_root:\
+                key_root += \cf5 "/"\cf4 \
+            to_upload: \cf7 List\cf4 [Path] = [master_png] + web_paths + ([avif_path] \cf6 if\cf4  avif_path \cf6 else\cf4  [])\
+            \cf6 for\cf4  p \cf6 in\cf4  to_upload:\
+                
+\f4\i \cf3 # Organize keys by sku/variant/type (master|web)
+\f5\i0 \cf4 \
+                sub = \cf5 "master"\cf4  \cf6 if\cf4  p.parent == master_dir \cf6 else\cf4  \cf5 "web"\cf4 \
+                key = \cf5 f"\cf9 \{key_root\}\{args.sku\}\cf5 /\cf9 \{args.variant\}\cf5 /\cf9 \{sub\}\cf5 /\cf9 \{p.name\}\cf5 "\cf4 \
+                meta = upload_s3(p, args.s3_bucket, key, args.public_base_url)\
+                uploads.append(\{\cf5 "local"\cf4 : str(p), \cf5 "key"\cf4 : key, **meta\})\
+\
+    
+\f4\i \cf3 # Manifest
+\f5\i0 \cf4 \
+    created_at = now_iso()\
+    manifest = \{\
+        \cf5 "created_at"\cf4 : created_at,\
+        \cf5 "sku"\cf4 : args.sku,\
+        \cf5 "variant"\cf4 : args.variant,\
+        \cf5 "version"\cf4 : args.version,\
+        \cf5 "content_hash"\cf4 : content_hash,\
+        \cf5 "paths"\cf4 : \{\
+            \cf5 "master"\cf4 : str(master_png),\
+            \cf5 "web"\cf4 : [str(p) \cf6 for\cf4  p \cf6 in\cf4  web_paths],\
+            \cf5 "avif"\cf4 : str(avif_path) \cf6 if\cf4  avif_path \cf6 else\cf4  \cf8 None\cf4 ,\
+        \},\
+        \cf5 "files"\cf4 : \{\
+            \cf5 "master"\cf4 : \{\cf5 "sha256"\cf4 : sha256_bytes(Path(master_png).read_bytes()), **file_facts(master_png)\},\
+            \cf5 "web"\cf4 : [\
+                \{\cf5 "path"\cf4 : str(p), \cf5 "sha256"\cf4 : sha256_bytes(p.read_bytes()), **file_facts(p)\}\
+                \cf6 for\cf4  p \cf6 in\cf4  web_paths\
+            ],\
+            \cf5 "avif"\cf4 : (\
+                \{\cf5 "path"\cf4 : str(avif_path), \cf5 "sha256"\cf4 : sha256_bytes(Path(avif_path).read_bytes()), **file_facts(avif_path)\}\
+                \cf6 if\cf4  avif_path \cf6 else\cf4  \cf8 None\cf4 \
+            ),\
+        \},\
+        \cf5 "uploads"\cf4 : uploads,\
+        \cf5 "qa_summary"\cf4 : gate,\
+        \cf5 "accessibility"\cf4 : \{\
+            \cf5 "label_contrast_ratio"\cf4 : gate.get(\cf5 "label_contrast_ratio"\cf4 ),\
+            \cf5 "wcag_AA_pass"\cf4 : (gate.get(\cf5 "label_contrast_ratio"\cf4 ) \cf6 or\cf4  \cf7 0\cf4 ) >= \cf7 4.5\cf4 \
+            \cf6 if\cf4  gate.get(\cf5 "label_contrast_ratio"\cf4 ) \cf6 is\cf4  \cf6 not\cf4  \cf8 None\cf4 \
+            \cf6 else\cf4  \cf8 None\cf4 ,\
+        \},\
+        \cf5 "cdn_base_url"\cf4 : args.public_base_url,\
+        \cf5 "s3_bucket"\cf4 : args.s3_bucket,\
+        \cf5 "s3_prefix"\cf4 : args.s3_prefix,\
+        \cf5 "analysis_excerpt"\cf4 : \{\
+            \cf5 "pipeline_version"\cf4 : analysis.get(\cf5 "processing_metadata"\cf4 , \{\}).get(\cf5 "pipeline_version"\cf4 ),\
+            \cf5 "primary_hex"\cf4 : (analysis.get(\cf5 "color_extraction"\cf4 , \{\}).get(\cf5 "primary_color"\cf4 , \{\}) \cf6 or\cf4  \{\}).get(\cf5 "hex_value"\cf4 ),\
+            \cf5 "category"\cf4 : (analysis.get(\cf5 "garment_categorization"\cf4 , \{\}).get(\cf5 "primary_classification"\cf4 , \{\}) \cf6 or\cf4  \{\}).get(\
+                \cf5 "category"\cf4 \
+            ),\
+            \cf5 "specific_type"\cf4 : (analysis.get(\cf5 "garment_categorization"\cf4 , \{\}).get(\cf5 "primary_classification"\cf4 , \{\}) \cf6 or\cf4  \{\}).get(\
+                \cf5 "specific_type"\cf4 \
+            ),\
+        \},\
+    \}\
+\
+    manif_dir.mkdir(parents=\cf8 True\cf4 , exist_ok=\cf8 True\cf4 )\
+    manifest_path = manif_dir / \cf5 "delivery_manifest.json"\cf4 \
+    manifest_path.write_text(json.dumps(manifest, indent=\cf7 2\cf4 ), encoding=\cf5 "utf-8"\cf4 )\
+\
+    
+\f4\i \cf3 # Gate enforcement
+\f5\i0 \cf4 \
+    \cf6 if\cf4  \cf6 not\cf4  gate[\cf5 "overall_pass"\cf4 ] \cf6 and\cf4  \cf6 not\cf4  args.no_fail:\
+        log(\cf5 "[FAIL] Quality gate failed. See delivery_manifest.json for details."\cf4 )\
+        print(json.dumps(gate, indent=\cf7 2\cf4 ))\
+        sys.exit(\cf7 1\cf4 )\
+\
+    
+\f4\i \cf3 # Summary
+\f5\i0 \cf4 \
+    print(\cf5 "\uc0\u9989  Step 5 complete."\cf4 )\
+    print(\cf5 f"Master:   \cf9 \{master_png\}\cf5 "\cf4 )\
+    \cf6 for\cf4  p \cf6 in\cf4  web_paths:\
+        print(\cf5 f"Variant:  \cf9 \{p\}\cf5 "\cf4 )\
+    \cf6 if\cf4  avif_path:\
+        print(\cf5 f"Variant:  \cf9 \{avif_path\}\cf5 "\cf4 )\
+    print(\cf5 f"Manifest: \cf9 \{manifest_path\}\cf5 "\cf4 )\
+    \cf6 if\cf4  args.s3_bucket \cf6 and\cf4  uploads:\
+        print(\cf5 f"Uploaded \cf9 \{len(uploads)\}\cf5  files to s3://\cf9 \{args.s3_bucket\}\cf5 /\cf9 \{(args.s3_prefix \cf6 or\cf9  \cf5 ''\cf9 ).rstrip(\cf5 '/'\cf9 )\}\cf5 /\'85"\cf4 )\
+\
+\
+\cf6 if\cf4  __name__ == \cf5 "__main__"\cf4 :\
+    main()
+\f3\fs24 \cf0 \
+\
+\pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\sl324\slmult1\pardirnatural\partightenfactor0
+
+\f6\b\fs30 \cf2 What changed (quick scan)
+\f0\b0\fs28 \cf2 \
+\pard\tqr\tx100\tx260\li260\fi-260\sl324\slmult1\sb240\partightenfactor0
+\cf2 	\'95	Fixed indentation and removed shell-hostile 
+\f1 \cf2 *
+\f0 \cf2  in filenames; stem is now 
+\f1 \cf2 SKU__variant__vSEMVER__SHA10
+\f0 \cf2 .\
+	\'95	Robust ICC handling (PNG/WebP/AVIF) with safe fallback if 
+\f1 \cf2 ImageCms
+\f0 \cf2  is missing.\
+	\'95	Configurable sizes + optional 
+\f2\b lossless WebP
+\f0\b0 .\
+	\'95	AVIF only if plugin detected; otherwise silently skip with a warning.\
+	\'95	Better S3 metadata (content type, immutable cache) and a cleaner key layout.\
+	\'95	Richer manifest: per-file width/height/bytes + sha256; QA/accessibility fields preserved.\
+	\'95	Deterministic hashing: computed from 
+\f2\b final master PNG bytes
+\f0\b0  that will be shipped.}

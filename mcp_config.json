@@ -1,0 +1,29 @@
+{
+  "mcpServers": {
+    "photostudio-pipeline": {
+      "command": "python",
+      "args": ["mcp_server/photostudio_mcp.py"],
+      "working_directory": "/Users/Peter/Projects/json-ghost-mannequin-pipeline",
+      "env": {
+        "PYTHONPATH": "/Users/Peter/Projects/json-ghost-mannequin-pipeline",
+        "LOG_LEVEL": "INFO"
+      },
+      "start_on_launch": true
+    },
+    "github": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "https://api.githubcopilot.com/mcp/"],
+      "start_on_launch": true
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/Peter/Projects/json-ghost-mannequin-pipeline"],
+      "start_on_launch": true
+    },
+    "notes": {
+      "command": "npx", 
+      "args": ["-y", "@modelcontextprotocol/server-notes", "--notes-dir", "/Users/Peter/Documents/notes"],
+      "start_on_launch": false
+    }
+  }
+}

@@ -1,0 +1,145 @@
+# Style Kit Configuration for Ghost-Mannequin Pipeline
+# Defines style guardrails, prompt templates, and rendering parameters
+
+# Global Style Settings
+style:
+  brand: "photostudio.io"
+  aesthetic: "clean_minimal"
+  color_profile: "srgb"
+  
+# Prompt Templates by Garment Category  
+templates:
+  shirt:
+    base_prompt: "professional product photography, {garment_description}, ghost mannequin effect, clean white background, studio lighting"
+    style_modifiers:
+      - "crisp fabric texture"
+      - "natural draping"
+      - "sharp focus"
+      - "commercial quality"
+    negative_prompt: "wrinkled fabric, shadows, colored background, model, person, hands"
+    
+  dress:
+    base_prompt: "elegant product photography, {garment_description}, invisible mannequin, pristine white background, professional lighting"
+    style_modifiers:
+      - "flowing fabric"
+      - "refined silhouette"
+      - "luxury presentation"
+      - "high-end fashion"
+    negative_prompt: "creases, model, person, cluttered background, poor lighting"
+    
+  jacket:
+    base_prompt: "premium product photography, {garment_description}, hollow man effect, clean white studio background"
+    style_modifiers:
+      - "structured form"
+      - "sharp tailoring"
+      - "professional presentation"
+      - "commercial photography"
+    negative_prompt: "wrinkles, model wearing, person, messy background"
+
+  pants:
+    base_prompt: "professional fashion photography, {garment_description}, ghost mannequin technique, white background, studio quality"
+    style_modifiers:
+      - "clean lines"
+      - "proper fit"
+      - "commercial standard"
+      - "sharp details"
+    negative_prompt: "model, person wearing, colored background, wrinkled fabric"
+
+# Style Guardrails
+guardrails:
+  forbidden_terms:
+    - "model"
+    - "person" 
+    - "human"
+    - "wearing"
+    - "mannequin head"
+    - "face"
+    - "hands"
+    - "skin"
+    
+  required_terms:
+    - "white background"
+    - "professional"
+    - "commercial"
+    
+  quality_terms:
+    - "high resolution"
+    - "sharp focus"
+    - "commercial quality"
+    - "studio lighting"
+
+# Color Guidance
+color_guidance:
+  primary_enhancement: 1.2  # Boost primary garment color
+  background_purity: 0.95   # White background purity threshold
+  contrast_min: 0.3         # Minimum contrast between garment and background
+  
+# Fabric-Specific Adjustments
+fabric_adjustments:
+  cotton:
+    texture_emphasis: 1.1
+    lighting: "soft diffused"
+    
+  silk:
+    texture_emphasis: 1.3
+    lighting: "controlled specular"
+    sheen_factor: 0.8
+    
+  denim:
+    texture_emphasis: 1.4
+    lighting: "directional"
+    contrast_boost: 1.2
+    
+  wool:
+    texture_emphasis: 1.2
+    lighting: "even diffused"
+    
+  polyester:
+    texture_emphasis: 0.9
+    lighting: "soft"
+    
+  linen:
+    texture_emphasis: 1.3
+    lighting: "natural diffused"
+
+# Rendering Parameters
+rendering:
+  sdxl:
+    guidance_scale: 7.5
+    num_inference_steps: 50
+    strength: 0.8
+    
+  controlnet:
+    conditioning_scale: 1.0
+    guess_mode: false
+    
+  ip_adapter:
+    scale: 0.6
+    
+# Quality Thresholds
+quality_thresholds:
+  min_delta_e: 2.0
+  min_hollow_quality: 0.4
+  min_sharpness: 0.3
+  min_background_score: 0.8
+  min_composite_score: 0.6
+
+# Template Variations for A/B Testing
+variations:
+  lighting:
+    - "studio lighting"
+    - "professional lighting"
+    - "commercial lighting"
+    - "soft studio lighting"
+    
+  quality:
+    - "high resolution"
+    - "commercial quality"
+    - "professional quality"
+    - "premium quality"
+    
+  background:
+    - "white background"
+    - "clean white background" 
+    - "pristine white background"
+    - "pure white studio background"

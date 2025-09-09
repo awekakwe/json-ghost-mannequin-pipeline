@@ -1,0 +1,684 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2822
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\paperw11900\paperh16840\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\pard\tx566\tx1133\tx1700\tx2267\tx2834\tx3401\tx3968\tx4535\tx5102\tx5669\tx6236\tx6803\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 #!/usr/bin/env python3\
+# coding: utf-8\
+\
+"""\
+renderer.py \'97 Step 3/6 Ghost-Mannequin Renderer (SDXL + ControlNet + QA)  v3.0\
+\
+Plugs into Step-1 (alpha.png, mask.png, label_crop.png?, garment_analysis.json)\
+and Step-2 (enhanced_prompt.txt). Adds:\
+- Correct inpaint mask polarity + correct interior band ring calculation\
+- Depth detector caching\
+- Proper LAB conversion for \uc0\u916 E (no double gamma)\
+- Label contrast QA & gating\
+- Deterministic execution, FP16 autocast, size multiple-of-8 enforcement\
+- Uses Step-1 mask for \uc0\u916 E region (stable)\
+- Memory safeties: slicing / attention; explicit dtype/device; graceful CPU fallback\
+"""\
+\
+from __future__ import annotations\
+import os, json, math, random, argparse, time\
+from dataclasses import dataclass, asdict\
+from pathlib import Path\
+from typing import Optional, Tuple, Dict, Any, List\
+\
+import numpy as np\
+from PIL import Image, ImageOps\
+import cv2\
+import torch\
+\
+from diffusers import (\
+    StableDiffusionXLControlNetInpaintPipeline,\
+    ControlNetModel,\
+    AutoencoderKL,\
+    DPMSolverMultistepScheduler,\
+    UniPCMultistepScheduler,\
+)\
+# Optional: controlnet_aux depth. We lazily import & cache.\
+try:\
+    from controlnet_aux import MidasDetector\
+    HAVE_MIDAS = True\
+except Exception:\
+    HAVE_MIDAS = False\
+\
+\
+# -----------------------------\
+# Determinism & environment\
+# -----------------------------\
+def set_determinism(seed: int = 12345):\
+    random.seed(seed)\
+    np.random.seed(seed)\
+    torch.manual_seed(seed)\
+    torch.cuda.manual_seed_all(seed)\
+    torch.backends.cudnn.benchmark = False\
+    try:\
+        torch.use_deterministic_algorithms(True, warn_only=True)\
+    except Exception:\
+        pass\
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")\
+\
+\
+# -----------------------------\
+# Config dataclasses\
+# -----------------------------\
+@dataclass\
+class ModelPaths:\
+    base: str = "stabilityai/stable-diffusion-xl-base-1.0"\
+    vae: Optional[str] = None  # e.g., "madebyollin/sdxl-vae-fp16-fix"\
+    controlnet_canny: str = "diffusers/controlnet-canny-sdxl-1.0"\
+    controlnet_depth: str = "diffusers/controlnet-depth-sdxl-1.0"\
+    ip_adapter: Optional[str] = None  # e.g., "h94/IP-Adapter" (API varies by diffusers version)\
+\
+\
+@dataclass\
+class RendererConfig:\
+    size: int = 2048                 # will be rounded to multiple of 8\
+    frame_fill_pct: int = 85\
+    guidance_scale: float = 5.5\
+    num_inference_steps: int = 28\
+    canny_low: int = 80\
+    canny_high: int = 160\
+    controlnet_weight_canny: float = 0.7\
+    controlnet_weight_depth: float = 0.3\
+    negative_prompt: str = (\
+        "no background, no props, no hands, no mannequin, "\
+        "no patterns not in JSON, no extra pockets, no extra hoods"\
+    )\
+    delta_e_tolerance: float = 2.0\
+    retries: int = 2\
+    retry_guidance_delta: float = 0.5\
+    retry_cnet_delta: float = 0.1\
+    use_unipc: bool = True\
+    use_fp16: bool = True\
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"\
+    # Label preservation\
+    protect_label_bbox: bool = True\
+    label_reference_as_ip: bool = False  # if IP-Adapter ref used\
+    # Ghost interior shading\
+    interior_band_r: int = 8\
+    interior_dark_amount: float = 0.07  # 7% darkening\
+\
+\
+@dataclass\
+class QAThresholds:\
+    label_min_contrast: float = 4.5  # WCAG-like\
+    # Note: you can add OCR/structure thresholds later\
+\
+\
+# -----------------------------\
+# Utility: color & LAB\
+# -----------------------------\
+def _srgb_to_linear_01(x_8bit: np.ndarray) -> np.ndarray:\
+    """x_8bit: ...x3 uint8, returns linear 0..1 for WCAG luminance math."""\
+    x = x_8bit.astype(np.float32) / 255.0\
+    return np.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4).astype(np.float32)\
+\
+def _rgb_to_lab_opencv(rgb_u8: np.ndarray) -> np.ndarray:\
+    """\
+    Accurate LAB via OpenCV assuming sRGB input. No manual linearization here.\
+    rgb_u8: HxWx3 uint8\
+    returns: HxWx3 float32 in LAB\
+    """\
+    bgr = rgb_u8[..., ::-1]\
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)\
+    return lab.astype(np.float32)\
+\
+def _delta_e_ciede2000(lab1: np.ndarray, lab2: np.ndarray) -> np.ndarray:\
+    # Vectorized CIEDE2000 (as in your original, with numeric guards)\
+    L1, a1, b1 = lab1[..., 0], lab1[..., 1], lab1[..., 2]\
+    L2, a2, b2 = lab2[..., 0], lab2[..., 1], lab2[..., 2]\
+    avg_L = (L1 + L2) / 2.0\
+    C1 = np.sqrt(a1**2 + b1**2)\
+    C2 = np.sqrt(a2**2 + b2**2)\
+    avg_C = (C1 + C2) / 2.0\
+    G = 0.5 * (1 - np.sqrt((avg_C**7) / (avg_C**7 + 25**7 + 1e-12)))\
+    a1p = (1 + G) * a1\
+    a2p = (1 + G) * a2\
+    C1p = np.sqrt(a1p**2 + b1**2)\
+    C2p = np.sqrt(a2p**2 + b2**2)\
+    avg_Cp = (C1p + C2p) / 2.0\
+    h1p = np.degrees(np.arctan2(b1, a1p)) % 360.0\
+    h2p = np.degrees(np.arctan2(b2, a2p)) % 360.0\
+    deltahp = h2p - h1p\
+    deltahp = np.where(deltahp > 180, deltahp - 360, deltahp)\
+    deltahp = np.where(deltahp < -180, deltahp + 360, deltahp)\
+    deltaLp = L2 - L1\
+    deltaCp = C2p - C1p\
+    deltaHp = 2 * np.sqrt(C1p * C2p + 1e-12) * np.sin(np.radians(deltahp) / 2.0)\
+    avg_Lp = (L1 + L2) / 2.0\
+    avg_hp = (h1p + h2p) / 2.0\
+    avg_hp = np.where(np.abs(h1p - h2p) > 180, avg_hp + 180, avg_hp) % 360.0\
+    T = (\
+        1\
+        - 0.17 * np.cos(np.radians(avg_hp - 30))\
+        + 0.24 * np.cos(np.radians(2 * avg_hp))\
+        + 0.32 * np.cos(np.radians(3 * avg_hp + 6))\
+        - 0.20 * np.cos(np.radians(4 * avg_hp - 63))\
+    )\
+    Sl = 1 + (0.015 * (avg_Lp - 50) ** 2) / np.sqrt(20 + (avg_Lp - 50) ** 2 + 1e-12)\
+    Sc = 1 + 0.045 * avg_Cp\
+    Sh = 1 + 0.015 * avg_Cp * T\
+    delta_ro = 30 * np.exp(-((avg_hp - 275) / 25) ** 2)\
+    Rc = 2 * np.sqrt((avg_Cp**7) / (avg_Cp**7 + 25**7 + 1e-12))\
+    Rt = -Rc * np.sin(np.radians(2 * delta_ro))\
+    kL = kC = kH = 1.0\
+    dE = np.sqrt(\
+        (deltaLp / (kL * Sl + 1e-12)) ** 2\
+        + (deltaCp / (kC * Sc + 1e-12)) ** 2\
+        + (deltaHp / (kH * Sh + 1e-12)) ** 2\
+        + Rt * (deltaCp / (kC * Sc + 1e-12)) * (deltaHp / (kH * Sh + 1e-12))\
+    )\
+    return dE.astype(np.float32)\
+\
+def hex_to_rgb(hex_str: str) -> Tuple[int, int, int]:\
+    h = hex_str.strip().lstrip("#")\
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)\
+\
+\
+# -----------------------------\
+# Utility: masks & geometry\
+# -----------------------------\
+def load_mask(path: Path, size: int) -> np.ndarray:\
+    """Load a binary mask, resize to (size,size)."""\
+    m = Image.open(path).convert("L").resize((size, size), Image.BOX)\
+    m = np.array(m, dtype=np.uint8)\
+    m = np.where(m > 127, 255, 0).astype(np.uint8)\
+    return m\
+\
+def ensure_square_and_resize(img: Image.Image, size: int) -> Image.Image:\
+    """Pad to square with transparent BG, then resize to target (keeps RGBA)."""\
+    w, h = img.size\
+    s = max(w, h)\
+    bg = Image.new("RGBA", (s, s), (255, 255, 255, 0))\
+    bg.paste(img, ((s - w) // 2, (s - h) // 2))\
+    return bg.resize((size, size), Image.LANCZOS)\
+\
+def round_to_multiple_of_8(n: int) -> int:\
+    return int((n // 8) * 8) if n % 8 == 0 else int(((n // 8) + 1) * 8)\
+\
+def interior_band(mask: np.ndarray, r: int = 8) -> np.ndarray:\
+    """\
+    Build a thin interior ring (erode by r then erode by 2r, subtract).\
+    This yields a band inside the garment suitable for subtle ghost shading/inpaint.\
+    """\
+    r = max(1, int(r))\
+    k1 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r, r))\
+    k2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r, 2 * r))\
+    er1 = cv2.erode(mask, k1)\
+    er2 = cv2.erode(mask, k2)\
+    band = cv2.subtract(er1, er2)  # <-- correct orientation: outer minus inner\
+    return np.where(band > 0, 255, 0).astype(np.uint8)\
+\
+def apply_interior_shading(img_rgb: Image.Image, band: np.ndarray, dark_amount: float) -> Image.Image:\
+    """\
+    Slightly darken a thin interior ring to fake depth without halos.\
+    band: uint8 mask where 255 == interior ring to darken\
+    """\
+    img_np = np.array(img_rgb.convert("RGB"), dtype=np.float32) / 255.0\
+    bandf = (band > 0).astype(np.float32)[..., None]\
+    out = img_np * (1.0 - bandf * float(dark_amount))\
+    return Image.fromarray(np.clip(out * 255.0, 0, 255).astype(np.uint8), mode="RGB")\
+\
+\
+# -----------------------------\
+# Control images\
+# -----------------------------\
+def build_canny_control(rgb_img: Image.Image, low: int, high: int) -> Image.Image:\
+    arr = np.array(rgb_img.convert("RGB"))\
+    edges = cv2.Canny(arr, int(low), int(high))\
+    canny = np.repeat(edges[..., None], 3, axis=-1)\
+    return Image.fromarray(canny, mode="RGB")\
+\
+class _DepthCache:\
+    model = None\
+    @classmethod\
+    def get(cls):\
+        if not HAVE_MIDAS:\
+            return None\
+        if cls.model is None:\
+            cls.model = MidasDetector.from_pretrained("Intel/dpt-hybrid-midas")\
+        return cls.model\
+\
+def build_depth_control(rgb_img: Image.Image) -> Optional[Image.Image]:\
+    md = _DepthCache.get()\
+    if md is None:\
+        return None\
+    depth = md(rgb_img)\
+    return depth.convert("RGB") if depth.mode != "RGB" else depth\
+\
+\
+# -----------------------------\
+# Label helper & QA\
+# -----------------------------\
+def read_label_bbox(json_data: Dict[str, Any]) -> Optional[Tuple[float, float, float, float]]:\
+    b = json_data.get("segmentation_results", \{\}).get("label_bbox_norm")\
+    # also support your earlier brand_information.label_bbox\
+    if b is None:\
+        b = json_data.get("brand_information", \{\}).get("label_bbox")\
+    if isinstance(b, (list, tuple)) and len(b) == 4:\
+        return float(b[0]), float(b[1]), float(b[2]), float(b[3])\
+    return None\
+\
+def protect_label_region(mask_like: np.ndarray, bbox_norm: Tuple[float, float, float, float]) -> np.ndarray:\
+    h, w = mask_like.shape\
+    x0 = max(0, min(int(bbox_norm[0] * w), w - 1))\
+    y0 = max(0, min(int(bbox_norm[1] * h), h - 1))\
+    x1 = max(0, min(int(bbox_norm[2] * w), w - 1))\
+    y1 = max(0, min(int(bbox_norm[3] * h), h - 1))\
+    protect = np.zeros_like(mask_like, dtype=np.uint8)\
+    cv2.rectangle(protect, (x0, y0), (x1, y1), 255, -1)\
+    return protect\
+\
+def relative_luminance(rgb_mean_8bit: np.ndarray) -> float:\
+    lin = _srgb_to_linear_01(rgb_mean_8bit.astype(np.uint8))\
+    r, g, b = lin[..., 0], lin[..., 1], lin[..., 2]\
+    return float(0.2126 * r + 0.7152 * g + 0.0722 * b)\
+\
+def label_contrast_ratio(img_rgb: Image.Image, bbox_norm: Tuple[float, float, float, float]) -> float:\
+    w, h = img_rgb.size\
+    x0 = max(0, int(bbox_norm[0] * w)); x1 = max(0, int(bbox_norm[2] * w))\
+    y0 = max(0, int(bbox_norm[1] * h)); y1 = max(0, int(bbox_norm[3] * h))\
+    patch = np.array(img_rgb.convert("RGB"))[y0:y1, x0:x1]\
+    if patch.size == 0:\
+        return 0.0\
+    gray = cv2.cvtColor(patch, cv2.COLOR_RGB2GRAY)\
+    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)\
+    fg = patch[th == 0]; bg = patch[th == 255]\
+    if fg.size == 0 or bg.size == 0:\
+        return 0.0\
+    L1 = relative_luminance(fg.mean(axis=0))\
+    L2 = relative_luminance(bg.mean(axis=0))\
+    return float((max(L1, L2) + 0.05) / (min(L1, L2) + 0.05))\
+\
+def compute_delta_e(img_rgb: Image.Image, garment_mask: np.ndarray, target_hex: str) -> float:\
+    rgb = np.array(img_rgb.convert("RGB"), dtype=np.uint8)\
+    lab = _rgb_to_lab_opencv(rgb)\
+    tr, tg, tb = hex_to_rgb(target_hex)\
+    tgt_rgb = np.full_like(rgb, (tr, tg, tb), dtype=np.uint8)\
+    tgt_lab = _rgb_to_lab_opencv(tgt_rgb)\
+    gm = garment_mask > 0\
+    if np.count_nonzero(gm) < 10:\
+        return 999.0\
+    dE = _delta_e_ciede2000(lab[gm], tgt_lab[gm])\
+    return float(np.mean(dE))\
+\
+\
+# -----------------------------\
+# Heuristic structure checks\
+# -----------------------------\
+def simple_structure_checks(img_rgb: Image.Image, garment_mask: np.ndarray) -> Dict[str, Any]:\
+    out = \{"zipper_like": False, "button_like": 0, "pocket_like": False\}\
+    gray = cv2.cvtColor(np.array(img_rgb.convert("RGB")), cv2.COLOR_RGB2GRAY)\
+    gmask = (garment_mask > 0).astype(np.uint8) * 255\
+    g = cv2.bitwise_and(gray, gray, mask=gmask)\
+\
+    # Buttons (circles)\
+    circles = cv2.HoughCircles(\
+        g, cv2.HOUGH_GRADIENT, dp=1.2, minDist=18, param1=80, param2=25, minRadius=4, maxRadius=20\
+    )\
+    out["button_like"] = 0 if circles is None else int(circles.shape[1])\
+\
+    # Zipper (approx parallel lines)\
+    edges = cv2.Canny(g, 80, 160)\
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, 100, minLineLength=40, maxLineGap=6)\
+    found = False\
+    if lines is not None and len(lines) < 120:\
+        limit = min(len(lines), 30)\
+        for i in range(limit):\
+            for j in range(i + 1, limit):\
+                x1, y1, x2, y2 = lines[i][0]\
+                x3, y3, x4, y4 = lines[j][0]\
+                a1 = math.atan2(y2 - y1, x2 - x1)\
+                a2 = math.atan2(y4 - y3, x4 - x3)\
+                if abs(a1 - a2) < 0.12:\
+                    dist = abs((y3 - y1) * math.cos(a1) - (x3 - x1) * math.sin(a1))\
+                    if 5 < dist < 30:\
+                        found = True\
+                        break\
+            if found:\
+                break\
+    out["zipper_like"] = bool(found)\
+\
+    # Pockets (rectangles)\
+    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)\
+    pocket_like = False\
+    for c in cnts[:80]:\
+        area = cv2.contourArea(c)\
+        if 400 < area < 5000:\
+            peri = cv2.arcLength(c, True)\
+            approx = cv2.approxPolyDP(c, 0.02 * peri, True)\
+            if len(approx) == 4:\
+                pocket_like = True\
+                break\
+    out["pocket_like"] = pocket_like\
+    return out\
+\
+\
+# -----------------------------\
+# Renderer\
+# -----------------------------\
+class GhostMannequinRenderer:\
+    def __init__(self, models: ModelPaths, cfg: RendererConfig, qa: QAThresholds = QAThresholds(),\
+                 seed: int = 12345, use_depth: bool = False):\
+        self.models = models\
+        self.cfg = cfg\
+        self.qa = qa\
+        self.seed = seed\
+        self.use_depth = use_depth\
+\
+        # Sanity for size (SDXL UNet stride)\
+        self.cfg.size = round_to_multiple_of_8(self.cfg.size)\
+\
+        set_determinism(seed)\
+\
+        # Build ControlNets\
+        cnet_list: List[ControlNetModel] = [\
+            ControlNetModel.from_pretrained(models.controlnet_canny,\
+                                            torch_dtype=self._dtype())\
+        ]\
+        if use_depth:\
+            cnet_list.append(ControlNetModel.from_pretrained(models.controlnet_depth,\
+                                                             torch_dtype=self._dtype()))\
+\
+        self.pipe = StableDiffusionXLControlNetInpaintPipeline.from_pretrained(\
+            models.base,\
+            controlnet=cnet_list if len(cnet_list) > 1 else cnet_list[0],\
+            torch_dtype=self._dtype(),\
+            variant=("fp16" if (self.cfg.use_fp16 and torch.cuda.is_available()) else None),\
+        )\
+\
+        if models.vae:\
+            self.pipe.vae = AutoencoderKL.from_pretrained(models.vae, torch_dtype=self._dtype())\
+\
+        # Scheduler\
+        if self.cfg.use_unipc:\
+            self.pipe.scheduler = UniPCMultistepScheduler.from_config(self.pipe.scheduler.config)\
+        else:\
+            self.pipe.scheduler = DPMSolverMultistepScheduler.from_config(self.pipe.scheduler.config)\
+\
+        # Memory/throughput toggles\
+        try:\
+            self.pipe.enable_vae_slicing()\
+            self.pipe.enable_vae_tiling()\
+        except Exception:\
+            pass\
+        if self.cfg.device == "cuda":\
+            try:\
+                self.pipe.enable_xformers_memory_efficient_attention()\
+            except Exception:\
+                pass\
+            # Offload to keep VRAM low for 2k renders\
+            try:\
+                self.pipe.enable_model_cpu_offload()\
+            except Exception:\
+                self.pipe.to("cuda")\
+        else:\
+            self.pipe.to("cpu")\
+\
+        # Optional IP-Adapter (API varies by version; guarded)\
+        self.ip_loaded = False\
+        if models.ip_adapter:\
+            try:\
+                # Some diffusers versions expose load_ip_adapter; others require manual wiring.\
+                if hasattr(self.pipe, "load_ip_adapter"):\
+                    self.pipe.load_ip_adapter(models.ip_adapter)\
+                    self.ip_loaded = True\
+            except Exception:\
+                self.ip_loaded = False\
+\
+        self.depth_available = HAVE_MIDAS and (build_depth_control(Image.new("RGB",(8,8))) is not None)\
+\
+        # Quiet progress bars for batch use\
+        try:\
+            self.pipe.set_progress_bar_config(disable=True)\
+        except Exception:\
+            pass\
+\
+    def _dtype(self):\
+        return torch.float16 if (self.cfg.use_fp16 and torch.cuda.is_available()) else torch.float32\
+\
+    def render(\
+        self,\
+        initial_rgba: Image.Image,\
+        garment_mask: np.ndarray,  # Step-1 mask, already binary\
+        prompt_text: str,\
+        primary_hex: Optional[str],\
+        label_bbox_norm: Optional[Tuple[float, float, float, float]] = None,\
+        label_reference: Optional[Image.Image] = None,\
+        out_dir: Path = Path("render_out"),\
+    ) -> Dict[str, Any]:\
+\
+        out_dir.mkdir(parents=True, exist_ok=True)\
+\
+        # Canvas + mask to target size\
+        init_sq = ensure_square_and_resize(initial_rgba, self.cfg.size)\
+        init_rgb = init_sq.convert("RGB")\
+        gm = cv2.resize(garment_mask, (self.cfg.size, self.cfg.size), interpolation=cv2.INTER_NEAREST)\
+\
+        # Control images\
+        canny = build_canny_control(init_rgb, self.cfg.canny_low, self.cfg.canny_high)\
+        controls = [canny]\
+        control_weights = [self.cfg.controlnet_weight_canny]\
+        if self.use_depth and self.depth_available:\
+            depth = build_depth_control(init_rgb)\
+            if depth is not None:\
+                controls.append(depth)\
+                control_weights.append(self.cfg.controlnet_weight_depth)\
+\
+        # Inpaint mask (Diffusers convention: WHITE=PAINT, BLACK=KEEP)\
+        band = interior_band(gm, r=self.cfg.interior_band_r)  # white ring to paint (ghost interior)\
+        inpaint_mask = band.copy()\
+\
+        # Protect label bbox area (set to BLACK=KEEP)\
+        if self.cfg.protect_label_bbox and label_bbox_norm:\
+            protect = protect_label_region(gm, label_bbox_norm)\
+            inpaint_mask = np.where(protect > 0, 0, inpaint_mask).astype(np.uint8)\
+\
+        # Optional IP-Adapter (light conditioning)\
+        ip_kwargs = \{\}\
+        if self.ip_loaded and label_reference is not None and self.cfg.label_reference_as_ip:\
+            # Exact kwargs depend on diffusers version; common names shown below:\
+            # ip_kwargs = \{"ip_adapter_image": label_reference.convert("RGB")\}\
+            pass\
+\
+        neg = self.cfg.negative_prompt\
+        prompt = prompt_text\
+\
+        # First pass\
+        result, qa = self._run_once(\
+            init_rgb, Image.fromarray(inpaint_mask),\
+            prompt, neg,\
+            controls, control_weights,\
+            primary_hex, gm,\
+            label_bbox_norm\
+        )\
+\
+        # Auto-retries on \uc0\u916 E or label contrast\
+        for k in range(self.cfg.retries):\
+            if qa.get("delta_e_ok", True) and qa.get("label_ok", True):\
+                break\
+            self.cfg.guidance_scale = max(3.5, self.cfg.guidance_scale + ((-1)**k) * self.cfg.retry_guidance_delta)\
+            control_weights = [\
+                max(0.05, min(1.5, cw + ((-1)**k) * self.cfg.retry_cnet_delta)) for cw in control_weights\
+            ]\
+            result, qa = self._run_once(\
+                result.convert("RGB"), Image.fromarray(inpaint_mask),\
+                prompt, neg,\
+                controls, control_weights,\
+                primary_hex, gm,\
+                label_bbox_norm\
+            )\
+\
+        # Save\
+        final_path = out_dir / "render_final.png"\
+        result.save(final_path, "PNG", optimize=True)\
+\
+        qa_path = out_dir / "render_meta.json"\
+        with open(qa_path, "w", encoding="utf-8") as f:\
+            json.dump(qa, f, indent=2)\
+\
+        return \{"image": str(final_path), "qa": str(qa_path), "qa_data": qa\}\
+\
+    # ---- internal ----\
+    def _run_once(\
+        self,\
+        init_rgb: Image.Image,\
+        inpaint_mask: Image.Image,\
+        prompt: str,\
+        negative_prompt: str,\
+        control_images: List[Image.Image],\
+        control_weights: List[float],\
+        primary_hex: Optional[str],\
+        garment_mask_for_qc: np.ndarray,\
+        label_bbox_norm: Optional[Tuple[float, float, float, float]],\
+    ) -> Tuple[Image.Image, Dict[str, Any]]:\
+\
+        g = torch.Generator(device=("cuda" if torch.cuda.is_available() else "cpu")).manual_seed(self.seed)\
+\
+        kwargs = dict(\
+            prompt=prompt,\
+            negative_prompt=negative_prompt,\
+            image=init_rgb,\
+            mask_image=inpaint_mask,                 # WHITE=PAINT, BLACK=KEEP\
+            control_image=control_images if len(control_images) > 1 else control_images[0],\
+            controlnet_conditioning_scale=control_weights if len(control_weights) > 1 else control_weights[0],\
+            num_inference_steps=self.cfg.num_inference_steps,\
+            guidance_scale=self.cfg.guidance_scale,\
+            generator=g,\
+            width=self.cfg.size,\
+            height=self.cfg.size,\
+        )\
+\
+        # fp16 autocast when available\
+        device_type = "cuda" if (torch.cuda.is_available() and self.pipe.device.type == "cuda") else "cpu"\
+        with torch.inference_mode(), torch.autocast(device_type=device_type, dtype=self._dtype(), enabled=(device_type=="cuda")):\
+            out = self.pipe(**kwargs).images[0]\
+\
+        # Subtle post ghost shading on the same interior band\
+        band = np.array(inpaint_mask.convert("L"))\
+        band = np.where(band > 127, 255, 0).astype(np.uint8)\
+        shaded = apply_interior_shading(out, band, self.cfg.interior_dark_amount)\
+\
+        # ---- QA ----\
+        qa: Dict[str, Any] = \{\
+            "seed": self.seed,\
+            "model": self.models.base,\
+            "scheduler": "UniPC" if self.cfg.use_unipc else "DPMSolver++",\
+            "guidance_scale": float(self.cfg.guidance_scale),\
+            "controlnet_weights": control_weights,\
+            "timestamp": time.time(),\
+        \}\
+\
+        # \uc0\u916 E on the true garment mask (resized)\
+        if primary_hex:\
+            dE = compute_delta_e(shaded, garment_mask_for_qc, primary_hex)\
+            qa["delta_e"] = dE\
+            qa["delta_e_ok"] = bool(dE <= self.cfg.delta_e_tolerance)\
+\
+            if not qa["delta_e_ok"]:\
+                # Conservative pull toward target color\
+                arr = np.array(shaded.convert("RGB"))\
+                tr, tg, tb = hex_to_rgb(primary_hex)\
+                mean_rgb = arr[garment_mask_for_qc > 0].mean(axis=0) if np.count_nonzero(garment_mask_for_qc) else np.array([128,128,128], np.float32)\
+                bias = (np.array([tr, tg, tb], np.float32) - mean_rgb) * 0.15\
+                arr = np.clip(arr.astype(np.float32) + bias, 0, 255).astype(np.uint8)\
+                shaded = Image.fromarray(arr, mode="RGB")\
+                qa["delta_e_post"] = compute_delta_e(shaded, garment_mask_for_qc, primary_hex)\
+                qa["delta_e_ok"] = bool(qa["delta_e_post"] <= self.cfg.delta_e_tolerance)\
+\
+        # Label contrast\
+        if label_bbox_norm:\
+            contrast = label_contrast_ratio(shaded, label_bbox_norm)\
+            qa["label_contrast"] = contrast\
+            qa["label_ok"] = bool(contrast >= self.qa.label_min_contrast)\
+        else:\
+            qa["label_ok"] = True\
+\
+        # Heuristic structure flags (optional, not gating)\
+        qa["structure"] = simple_structure_checks(shaded, garment_mask_for_qc)\
+\
+        return shaded, qa\
+\
+\
+# -----------------------------\
+# CLI / Runner\
+# -----------------------------\
+def read_text(path: Path) -> str:\
+    return Path(path).read_text(encoding="utf-8")\
+\
+def main():\
+    ap = argparse.ArgumentParser(description="Step 3/6 Ghost-Mannequin Renderer (SDXL + ControlNet + QA)")\
+    ap.add_argument("--input_dir", required=True, help="Folder with Step-1 outputs (alpha.png, mask.png, label_crop.png?)")\
+    ap.add_argument("--json", required=True, help="Step-1/2 JSON (garment_analysis.json)")\
+    ap.add_argument("--prompt", required=True, help="Step-2 enhanced prompt text file")\
+    ap.add_argument("--out_dir", default="render_out", help="Output directory")\
+    ap.add_argument("--seed", type=int, default=12345)\
+    ap.add_argument("--size", type=int, default=2048)\
+    ap.add_argument("--use_depth", action="store_true")\
+    ap.add_argument("--ip_adapter_weights", default=None, help="Optional IP-Adapter repo id or path")\
+    ap.add_argument("--base_model", default="stabilityai/stable-diffusion-xl-base-1.0")\
+    ap.add_argument("--vae", default=None)\
+    args = ap.parse_args()\
+\
+    input_dir = Path(args.input_dir)\
+    out_dir = Path(args.out_dir)\
+    out_dir.mkdir(parents=True, exist_ok=True)\
+\
+    # Load assets\
+    alpha_path = input_dir / "alpha.png"\
+    mask_path  = input_dir / "mask.png"\
+    label_path = input_dir / "label_crop.png"\
+\
+    if not alpha_path.exists() or not mask_path.exists():\
+        raise FileNotFoundError("alpha.png and mask.png are required from Step-1 outputs.")\
+\
+    initial_rgba = Image.open(alpha_path).convert("RGBA")\
+    with open(args.json, "r", encoding="utf-8") as f:\
+        j = json.load(f)\
+    prompt_text = read_text(Path(args.prompt))\
+\
+    # Primary color target\
+    primary_hex = (\
+        j.get("color_extraction", \{\}).get("primary_color", \{\}).get("hex_value", None)\
+    )\
+    if isinstance(primary_hex, str) and len(primary_hex) == 6 and not primary_hex.startswith("#"):\
+        primary_hex = f"#\{primary_hex\}"\
+\
+    # Label bbox (optional; prefer Step-1 normalised)\
+    label_bbox = read_label_bbox(j)\
+    label_ref = Image.open(label_path).convert("RGB") if label_path.exists() else None\
+\
+    # Config & models\
+    models = ModelPaths(\
+        base=args.base_model, vae=args.vae,\
+        controlnet_canny="diffusers/controlnet-canny-sdxl-1.0",\
+        controlnet_depth="diffusers/controlnet-depth-sdxl-1.0",\
+        ip_adapter=args.ip_adapter_weights,\
+    )\
+    cfg = RendererConfig(size=args.size)\
+\
+    renderer = GhostMannequinRenderer(models, cfg, seed=args.seed, use_depth=args.use_depth)\
+    gm = load_mask(mask_path, size=cfg.size)\
+\
+    result = renderer.render(\
+        initial_rgba=initial_rgba,\
+        garment_mask=gm,\
+        prompt_text=prompt_text,\
+        primary_hex=primary_hex,\
+        label_bbox_norm=label_bbox,\
+        label_reference=label_ref,\
+        out_dir=out_dir,\
+    )\
+\
+    print("\uc0\u9989  Render saved:", result["image"])\
+    print("\uc0\u55358 \u56810  QA saved:", result["qa"])\
+    print(json.dumps(result["qa_data"], indent=2))\
+\
+if __name__ == "__main__":\
+    main()}

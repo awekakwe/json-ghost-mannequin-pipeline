@@ -1,0 +1,890 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2822
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\paperw11900\paperh16840\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\pard\tx566\tx1133\tx1700\tx2267\tx2834\tx3401\tx3968\tx4535\tx5102\tx5669\tx6236\tx6803\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 #!/usr/bin/env python3\
+# -*- coding: utf-8 -*-\
+"""\
+qa_corrector.py  \'97  Step 4/6: Auto-QA + Auto-Correct + Candidate Selection  (v2.2)\
+\
+Improvements vs your v1:\
+- Otsu-based label contrast (foreground vs background means), not min/max extremes\
+- Cached EasyOCR reader (huge speedup when many candidates)\
+- Recenter now scale+center to meet target frame fill (clamped, white-safe)\
+- Configurable tech checks: --expected-size or --allow-multiple-of-8\
+- Optional parallelism: --workers N\
+- Adds SSIM when --reference is provided\
+- Optional deltaE heatmap & per-candidate corrected exports\
+"""\
+\
+from __future__ import annotations\
+import argparse, json, sys, os, time, hashlib, math, warnings\
+from dataclasses import dataclass, asdict\
+from pathlib import Path\
+from typing import Any, Dict, List, Optional, Tuple, Union\
+from concurrent.futures import ThreadPoolExecutor, as_completed\
+\
+import numpy as np\
+import cv2\
+from PIL import Image, ImageOps\
+\
+# Skimage for color science / \uc0\u916 E & metrics\
+from skimage import color as skcolor\
+from skimage.metrics import structural_similarity as sk_ssim\
+\
+# -------- optional heavy libs (handled gracefully)\
+try:\
+    import lpips, torch  # pip install lpips torch torchvision (CUDA optional)\
+    _HAS_LPIPS = True\
+except Exception:\
+    _HAS_LPIPS = False\
+\
+try:\
+    import easyocr                 # pip install easyocr\
+    _HAS_EASYOCR = True\
+except Exception:\
+    _HAS_EASYOCR = False\
+\
+try:\
+    import pytesseract             # plus system tesseract\
+    _HAS_TESSERACT = True\
+except Exception:\
+    _HAS_TESSERACT = False\
+\
+_EASYOCR_READER = None  # cached once\
+\
+# -------------------------\
+# Utility helpers\
+# -------------------------\
+def _now_iso() -> str:\
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())\
+\
+def _read_image(path: Union[str, Path]) -> np.ndarray:\
+    img = Image.open(str(path))\
+    if img.mode != "RGB":\
+        img = img.convert("RGB")\
+    return np.array(img)\
+\
+def _read_image_with_alpha(path: Union[str, Path]) -> Tuple[np.ndarray, Optional[np.ndarray]]:\
+    img = Image.open(str(path))\
+    if img.mode == "RGBA":\
+        arr = np.array(img)\
+        return arr[..., :3], arr[..., 3]\
+    return np.array(img.convert("RGB")), None\
+\
+def _save_png(path: Union[str, Path], rgb_u8: np.ndarray) -> None:\
+    Image.fromarray(rgb_u8, mode="RGB").save(str(path), format="PNG", optimize=True)\
+\
+def _save_webp(path: Union[str, Path], rgb_u8: np.ndarray, quality: int = 90) -> None:\
+    Image.fromarray(rgb_u8, mode="RGB").save(str(path), format="WEBP", quality=quality, method=6)\
+\
+def _hex_to_rgb01(hex_str: str) -> np.ndarray:\
+    hs = hex_str.strip()\
+    if not hs.startswith("#"):\
+        hs = "#" + hs\
+    r = int(hs[1:3], 16); g = int(hs[3:5], 16); b = int(hs[5:7], 16)\
+    return np.array([r, g, b], dtype=np.float32) / 255.0\
+\
+def _get(d: Dict, path: List[str], default=None):\
+    cur = d\
+    for k in path:\
+        if not isinstance(cur, dict) or k not in cur:\
+            return default\
+        cur = cur[k]\
+    return cur\
+\
+def _normalize_mask(mask_u8: np.ndarray, thr: int = 128) -> np.ndarray:\
+    if mask_u8.dtype == np.bool_:\
+        return (mask_u8.astype(np.uint8)) * 255\
+    if mask_u8.ndim == 3:\
+        mask_u8 = cv2.cvtColor(mask_u8, cv2.COLOR_RGB2GRAY)\
+    return (mask_u8 >= thr).astype(np.uint8) * 255\
+\
+def _ensure_same_size(img: np.ndarray, mask: np.ndarray) -> np.ndarray:\
+    if img.shape[:2] != mask.shape[:2]:\
+        mask = cv2.resize(mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)\
+    return mask\
+\
+def _draw_debug_overlay(\
+    base_rgb: np.ndarray,\
+    mask: Optional[np.ndarray],\
+    label_bbox_px: Optional[Tuple[int,int,int,int]],\
+    lines: List[Tuple[int,int,int,int]],\
+    circles: List[Tuple[int,int,int]],\
+) -> np.ndarray:\
+    ov = base_rgb.copy()\
+    if mask is not None:\
+        cnts,_ = cv2.findContours((mask>0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)\
+        cv2.drawContours(ov, cnts, -1, (0,255,255), 2)\
+    if label_bbox_px:\
+        x1,y1,x2,y2 = label_bbox_px\
+        cv2.rectangle(ov, (x1,y1), (x2,y2), (255,0,0), 2)\
+    for (x1,y1,x2,y2) in lines:\
+        cv2.line(ov, (x1,y1), (x2,y2), (0,200,0), 2)\
+    for (x,y,r) in circles:\
+        cv2.circle(ov, (x,y), r, (0,0,255), 2)\
+    return ov\
+\
+def _img_hash(rgb: np.ndarray) -> str:\
+    return hashlib.sha256(rgb.tobytes()).hexdigest()[:16]\
+\
+# -------------------------\
+# Color validation (\uc0\u916 E2000)\
+# -------------------------\
+def mean_delta_e2000_rgb(image_u8: np.ndarray, mask_u8: np.ndarray, target_hex: str,\
+                         max_samples: int = 100000, seed: int = 42) -> Dict[str, float]:\
+    img = (image_u8[..., :3] / 255.0).astype(np.float32)\
+    lab = skcolor.rgb2lab(img)\
+    m = mask_u8 > 0\
+    coords = np.argwhere(m)\
+    if coords.shape[0] == 0:\
+        return \{'mean_delta_e': 999.0, 'p95_delta_e': 999.0, 'max_delta_e': 999.0\}\
+    rng = np.random.default_rng(seed)\
+    sel = rng.choice(coords.shape[0], size=min(max_samples, coords.shape[0]), replace=False)\
+    yy, xx = coords[sel,0], coords[sel,1]\
+    lab_s = lab[yy, xx]\
+    t_lab = skcolor.rgb2lab(_hex_to_rgb01(target_hex).reshape(1,1,3))[0,0]\
+    de = skcolor.deltaE_ciede2000(lab_s, t_lab)\
+    return \{\
+        'mean_delta_e': float(np.mean(de)),\
+        'p95_delta_e': float(np.percentile(de, 95)),\
+        'max_delta_e': float(np.max(de))\
+    \}\
+\
+# -------------------------\
+# Structure validator\
+# -------------------------\
+@dataclass\
+class StructureResults:\
+    buttons_detected: int\
+    zipper_detected: bool\
+    zipper_lines: List[Tuple[int,int,int,int]]\
+    button_circles: List[Tuple[int,int,int]]\
+    pockets_hint: bool\
+    accuracy_flags: Dict[str, bool]\
+\
+def detect_structure(rgb_u8: np.ndarray, mask_u8: np.ndarray,\
+                     json_specs: Dict[str, Any]) -> StructureResults:\
+    gray = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2GRAY)\
+    roi = cv2.bitwise_and(gray, gray, mask=_normalize_mask(mask_u8))\
+\
+    circles = cv2.HoughCircles(\
+        roi, cv2.HOUGH_GRADIENT, dp=1.2, minDist=20,\
+        param1=80, param2=16, minRadius=6, maxRadius=24\
+    )\
+    button_circles = []\
+    if circles is not None and len(circles) > 0:\
+        for c in circles[0]:\
+            x,y,r = int(c[0]), int(c[1]), int(c[2])\
+            if 0 <= y < mask_u8.shape[0] and 0 <= x < mask_u8.shape[1] and mask_u8[y, x] > 0:\
+                button_circles.append((x,y,r))\
+\
+    h,w = roi.shape\
+    band = np.zeros_like(roi); bw = max(10, w//8); x1b = w//2 - bw//2; x2b = x1b + bw\
+    band[:, x1b:x2b] = roi[:, x1b:x2b]\
+    edges = cv2.Canny(band, 80, 160)\
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=60, minLineLength=40, maxLineGap=8)\
+    zipper_lines = []\
+    if lines is not None:\
+        for l in lines[:200]:\
+            x1,y1,x2,y2 = l[0]\
+            if abs(y2-y1) > 2*abs(x2-x1):  # near vertical\
+                zipper_lines.append((x1,y1,x2,y2))\
+\
+    pockets_hint = False\
+    conts,_ = cv2.findContours(cv2.Canny(roi, 80,160), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)\
+    for c in conts[:200]:\
+        area = cv2.contourArea(c)\
+        if 500 < area < 8000:\
+            peri = cv2.arcLength(c, True)\
+            approx = cv2.approxPolyDP(c, 0.02*peri, True)\
+            x,y,wc,hc = cv2.boundingRect(approx)\
+            if len(approx) in (4,5) and y > h*0.25:\
+                pockets_hint = True\
+                break\
+\
+    expected_closure = _get(json_specs, ["construction_details","closures","primary_closure"], "unknown")\
+    expected_buttons = int(_get(json_specs, ["construction_details","closures","closure_count"], 0) or 0)\
+    flags = \{\}\
+    if expected_closure == "buttons":\
+        flags["button_count_ok"] = abs(len(button_circles) - expected_buttons) <= 1\
+    if expected_closure == "zipper":\
+        flags["zipper_present_ok"] = len(zipper_lines) > 0\
+\
+    return StructureResults(\
+        buttons_detected=len(button_circles),\
+        zipper_detected=len(zipper_lines) > 0,\
+        zipper_lines=zipper_lines,\
+        button_circles=button_circles,\
+        pockets_hint=pockets_hint,\
+        accuracy_flags=flags\
+    )\
+\
+# -------------------------\
+# Label / Brand integrity\
+# -------------------------\
+def _wcag_contrast_otsu(patch_rgb_u8: np.ndarray) -> float:\
+    """Foreground/background via Otsu, then mean luminance ratio."""\
+    if patch_rgb_u8.size == 0:\
+        return 0.0\
+    gray = cv2.cvtColor(patch_rgb_u8, cv2.COLOR_RGB2GRAY)\
+    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)\
+    fg = patch_rgb_u8[th == 0]; bg = patch_rgb_u8[th == 255]\
+    if fg.size == 0 or bg.size == 0:\
+        return 0.0\
+    def _rel_lum(u8):\
+        x = u8.astype(np.float32)/255.0\
+        # WCAG linear approx\
+        return 0.2126*x[...,0] + 0.7152*x[...,1] + 0.0722*x[...,2]\
+    L1 = float(np.mean(_rel_lum(fg))); L2 = float(np.mean(_rel_lum(bg)))\
+    return (max(L1, L2)+0.05) / (min(L1, L2)+0.05)\
+\
+def _fuzzy_ratio(a: str, b: str) -> float:\
+    import difflib\
+    return difflib.SequenceMatcher(a=a.lower().strip(), b=b.lower().strip()).ratio()\
+\
+@dataclass\
+class LabelResults:\
+    bbox_preserved: bool\
+    contrast_ratio: float\
+    contrast_pass: bool\
+    text_readable: bool\
+    ocr_confidence: float\
+    text_match: Optional[float]\
+    overall_pass: bool\
+    best_text: str\
+    engine: str\
+\
+def _get_easyocr_reader():\
+    global _EASYOCR_READER\
+    if not _HAS_EASYOCR:\
+        return None\
+    if _EASYOCR_READER is None:\
+        _EASYOCR_READER = easyocr.Reader(['en'], gpu=False)\
+    return _EASYOCR_READER\
+\
+def _ocr_dual_engine(patch_rgb_u8: np.ndarray) -> Tuple[str,float,str]:\
+    texts, confs, engines = [], [], []\
+    rdr = _get_easyocr_reader()\
+    if rdr is not None:\
+        try:\
+            res = rdr.readtext(patch_rgb_u8, detail=True)\
+            txt = " ".join([r[1] for r in res])\
+            conf = float(np.mean([r[2] for r in res])) if res else 0.0\
+            texts.append(txt); confs.append(conf); engines.append("easyocr")\
+        except Exception:\
+            pass\
+    if _HAS_TESSERACT:\
+        try:\
+            data = pytesseract.image_to_data(patch_rgb_u8, output_type=pytesseract.Output.DICT, config='--psm 7')\
+            words = [w for w,c in zip(data.get('text',[]), data.get('conf',[])) if w and c and int(c) > 50]\
+            txt = " ".join(words)\
+            conf_list = [int(c) for c in data.get('conf',[]) if c and int(c) > 0]\
+            conf = float(np.mean(conf_list))/100.0 if conf_list else 0.0\
+            texts.append(txt); confs.append(conf); engines.append("tesseract")\
+        except Exception:\
+            pass\
+    if not texts:\
+        return "", 0.0, "none"\
+    i = int(np.argmax(confs))\
+    return texts[i], float(confs[i]), engines[i]\
+\
+def validate_label(rgb_u8: np.ndarray,\
+                   label_bbox_px: Optional[Tuple[int,int,int,int]],\
+                   expected_text: Optional[str],\
+                   contrast_threshold: float = 4.5) -> LabelResults:\
+    if not label_bbox_px:\
+        return LabelResults(True, 21.0, True, True, 1.0, None, True, "", "none")\
+    h,w,_ = rgb_u8.shape\
+    x1,y1,x2,y2 = label_bbox_px\
+    x1 = max(0, min(w-1, x1)); x2 = max(0, min(w, x2))\
+    y1 = max(0, min(h-1, y1)); y2 = max(0, min(h, y2))\
+    if x2<=x1 or y2<=y1:\
+        return LabelResults(False, 0.0, False, False, 0.0, None, False, "", "none")\
+    patch = rgb_u8[y1:y2, x1:x2]\
+    cr = _wcag_contrast_otsu(patch)\
+    best_text, best_conf, engine = _ocr_dual_engine(patch)\
+    readable = (best_conf >= 0.70) if (engine != "none") else True\
+    text_match = _fuzzy_ratio(best_text, expected_text) if (expected_text and best_text) else None\
+    overall = (cr >= contrast_threshold) and readable\
+    return LabelResults(True, cr, cr>=contrast_threshold, readable, best_conf, text_match, overall, best_text, engine)\
+\
+# -------------------------\
+# Ghost Mannequin hollow check\
+# -------------------------\
+@dataclass\
+class HollowResult:\
+    openings: Dict[str, Dict[str, float]]\
+    overall_hollow_quality: bool\
+    total_openings_detected: int\
+\
+def _opening_luminance_metrics(gray: np.ndarray, contour: np.ndarray, band_px: int = 8) -> Dict[str, float]:\
+    h,w = gray.shape\
+    mask_in = np.zeros((h,w), np.uint8)\
+    cv2.drawContours(mask_in, [contour], -1, 255, thickness=-1)\
+    dil = cv2.dilate(mask_in, cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(band_px,band_px)))\
+    ero = cv2.erode(mask_in,  cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(band_px,band_px)))\
+    band = cv2.bitwise_xor(dil, ero)\
+    interior = gray[mask_in>0]; boundary = gray[band>0]\
+    if interior.size==0 or boundary.size==0:\
+        return \{'is_hollow': 0.0, 'luminance_difference': 0.0, 'depth_score': 0.0, 'continuous': 0.0\}\
+    intr = float(np.mean(interior)); bnd = float(np.mean(boundary))\
+    lum_diff = (bnd - intr) / max(1.0, bnd)\
+    sob = cv2.Sobel(gray, cv2.CV_32F, 1, 1, ksize=3); depth_score = float(np.mean(np.abs(sob[mask_in>0]))) / 255.0\
+    cont = float(np.mean(band>0))\
+    return \{'is_hollow': 1.0 if lum_diff >= 0.08 else 0.0, 'luminance_difference': lum_diff, 'depth_score': depth_score, 'continuous': cont\}\
+\
+def validate_hollow(rgb_u8: np.ndarray, mask_u8: np.ndarray) -> HollowResult:\
+    gray = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2GRAY)\
+    cnts,hier = cv2.findContours((mask_u8>0).astype(np.uint8), cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)\
+    res: Dict[str, Dict[str, float]] = \{\}; count = 0\
+    if cnts is not None and hier is not None:\
+        for cnt, hinfo in zip(cnts, hier[0]):\
+            if hinfo[3] >= 0:  # holes only\
+                M = cv2.moments(cnt)\
+                cx = int((M['m10']/M['m00'])) if M['m00']!=0 else 0\
+                cy = int((M['m01']/M['m00'])) if M['m00']!=0 else 0\
+                metrics = _opening_luminance_metrics(gray, cnt)\
+                tag = "neck" if cy < rgb_u8.shape[0]*0.35 else ("sleeve" if cx < rgb_u8.shape[1]*0.3 or cx > rgb_u8.shape[1]*0.7 else "other")\
+                res[f"\{tag\}_\{count\}"] = metrics; count += 1\
+    overall = any((v['is_hollow']>0.5 and v['depth_score']>0.1) for v in res.values())\
+    return HollowResult(res, overall, count)\
+\
+# -------------------------\
+# Perceptual Quality (optional)\
+# -------------------------\
+class PerceptualAssessor:\
+    def __init__(self):\
+        self.enabled = _HAS_LPIPS\
+        if self.enabled:\
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')\
+            self.lpips_net = lpips.LPIPS(net='alex', version='0.1').to(self.device).eval()\
+\
+    @staticmethod\
+    def sharpness_laplacian(rgb_u8: np.ndarray) -> float:\
+        g = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2GRAY)\
+        return float(np.var(cv2.Laplacian(g, cv2.CV_64F)))\
+\
+    @staticmethod\
+    def rms_contrast(rgb_u8: np.ndarray) -> float:\
+        g = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2GRAY).astype(np.float32)/255.0\
+        return float(np.sqrt(np.mean((g - g.mean())**2)))\
+\
+    @staticmethod\
+    def _prep_t(rgb_u8: np.ndarray) -> torch.Tensor:\
+        t = torch.from_numpy(rgb_u8.astype(np.float32)/255.0).permute(2,0,1).unsqueeze(0)  # 1x3xHxW\
+        return t*2-1\
+\
+    def lpips_distance(self, a_u8: np.ndarray, b_u8: np.ndarray) -> Optional[float]:\
+        if not self.enabled: return None\
+        with torch.no_grad():\
+            t1 = self._prep_t(a_u8).to(self.device)\
+            t2 = self._prep_t(b_u8).to(self.device)\
+            return float(self.lpips_net(t1, t2).item())\
+\
+# -------------------------\
+# Auto-corrector\
+# -------------------------\
+class AutoCorrector:\
+    def __init__(self, exclude_label_bbox: Optional[Tuple[int,int,int,int]] = None):\
+        self.exclude_label_bbox = exclude_label_bbox\
+\
+    @staticmethod\
+    def _lab_bias_correction(img_u8: np.ndarray, mask_u8: np.ndarray, target_hex: str,\
+                             max_bias=(10.0, 10.0, 10.0)) -> Tuple[np.ndarray, np.ndarray]:\
+        img = np.clip(img_u8.astype(np.float32)/255.0, 0,1)\
+        lab = skcolor.rgb2lab(img)\
+        t_lab = skcolor.rgb2lab(_hex_to_rgb01(target_hex).reshape(1,1,3))[0,0]\
+        m = (mask_u8>0)\
+        if not np.any(m):\
+            return img_u8.copy(), np.array([0,0,0], dtype=np.float32)\
+        mean_lab = np.mean(lab[m], axis=0)\
+        bias = np.clip(t_lab - mean_lab, -np.array(max_bias), np.array(max_bias))\
+        lab_corr = lab.copy(); lab_corr[m] += bias\
+        out = (np.clip(skcolor.lab2rgb(lab_corr), 0,1)*255.0+0.5).astype(np.uint8)\
+        return out, bias.astype(np.float32)\
+\
+    @staticmethod\
+    def _normalize_white_bg(img_u8: np.ndarray, mask_u8: np.ndarray, tol: int = 2) -> np.ndarray:\
+        out = img_u8.copy(); bg = (mask_u8==0)\
+        if out[bg].size:\
+            near_white = np.all(out[bg] >= (255 - tol), axis=-1)\
+            out_bg = out[bg]; out_bg[near_white] = (255,255,255); out[bg] = out_bg\
+        return out\
+\
+    @staticmethod\
+    def _enhance_label_contrast(img_u8: np.ndarray, bbox: Tuple[int,int,int,int], amt: float = 1.15) -> np.ndarray:\
+        x1,y1,x2,y2 = bbox\
+        patch = img_u8[y1:y2, x1:x2].astype(np.float32)\
+        mean = np.mean(patch, axis=(0,1), keepdims=True)\
+        patch = np.clip(mean + (patch - mean)*amt, 0,255).astype(np.uint8)\
+        out = img_u8.copy(); out[y1:y2, x1:x2] = patch\
+        return out\
+\
+    @staticmethod\
+    def _scale_and_center(img_u8: np.ndarray, mask_u8: np.ndarray, target_fill=0.85) -> np.ndarray:\
+        """Scale+center garment to approximate target frame fill (max dim occupancy)."""\
+        H,W,_ = img_u8.shape\
+        ys, xs = np.where(mask_u8>0)\
+        if ys.size == 0:\
+            return img_u8\
+        x0,x1 = int(xs.min()), int(xs.max())\
+        y0,y1 = int(ys.min()), int(ys.max())\
+        bw, bh = (x1-x0+1), (y1-y0+1)\
+        current_fill = max(bw/W, bh/H)\
+        if current_fill <= 0:\
+            return img_u8\
+        if current_fill >= target_fill*0.98:\
+            # just center\
+            dx = (W - (x0+x1+1))//2\
+            dy = (H - (y0+y1+1))//2\
+            M = np.float32([[1,0,dx],[0,1,dy]])\
+            return cv2.warpAffine(img_u8, M, (W,H), flags=cv2.INTER_LANCZOS4,\
+                                  borderMode=cv2.BORDER_CONSTANT, borderValue=(255,255,255))\
+        scale = min(target_fill/current_fill, 1.20)  # clamp upscaling to +20%\
+        # scale around center by resizing whole image, then center-crop/pad\
+        newW, newH = int(W*scale), int(H*scale)\
+        resized = cv2.resize(img_u8, (newW, newH), interpolation=cv2.INTER_LANCZOS4)\
+        canvas = np.full((H,W,3), 255, np.uint8)\
+        ox = (W - newW)//2; oy = (H - newH)//2\
+        xA = max(0, ox); yA = max(0, oy)\
+        xB = min(W, ox + newW); yB = min(H, oy + newH)\
+        src_xA = max(0, -ox); src_yA = max(0, -oy)\
+        src_xB = src_xA + (xB - xA); src_yB = src_yA + (yB - yA)\
+        canvas[yA:yB, xA:xB] = resized[src_yA:src_yB, src_xA:src_xB]\
+        return canvas\
+\
+    def apply(self, img_u8: np.ndarray, mask_u8: np.ndarray,\
+              target_hex: Optional[str],\
+              needs_label_contrast_boost: bool,\
+              label_bbox_px: Optional[Tuple[int,int,int,int]]) -> Tuple[np.ndarray, List[str]]:\
+        applied: List[str] = []\
+        out = img_u8.copy()\
+\
+        # Exclude label from color correction\
+        garment_only = (mask_u8>0).astype(np.uint8)*255\
+        if label_bbox_px:\
+            excl = np.zeros_like(mask_u8, np.uint8)\
+            x1,y1,x2,y2 = label_bbox_px\
+            cv2.rectangle(excl, (x1,y1), (x2,y2), 255, -1)\
+            garment_only[excl>0] = 0\
+\
+        if target_hex and np.any(garment_only>0):\
+            out2, bias = self._lab_bias_correction(out, garment_only, target_hex)\
+            out = out2; applied.append(f"LAB color correction bias=\{bias.round(3).tolist()\}")\
+\
+        out = self._normalize_white_bg(out, mask_u8, tol=2); applied.append("Background normalized")\
+\
+        if needs_label_contrast_boost and label_bbox_px:\
+            out = self._enhance_label_contrast(out, label_bbox_px, amt=1.15)\
+            applied.append("Label contrast enhanced")\
+\
+        out = self._scale_and_center(out, mask_u8, target_fill=0.85); applied.append("Scale+center to frame fill")\
+        return out, applied\
+\
+# -------------------------\
+# Candidate scoring & ranking\
+# -------------------------\
+@dataclass\
+class CandidateScores:\
+    color_accuracy: float\
+    structural_fidelity: float\
+    brand_integrity: float\
+    ghost_quality: float\
+    perceptual_quality: float\
+    technical_specs: float\
+\
+DEFAULT_WEIGHTS = \{\
+    'color_accuracy': 0.25,\
+    'structural_fidelity': 0.20,\
+    'brand_integrity': 0.20,\
+    'ghost_quality': 0.15,\
+    'perceptual_quality': 0.12,\
+    'technical_specs': 0.08\
+\}\
+\
+def composite_score(scores: CandidateScores, weights: Dict[str,float]) -> float:\
+    return float(\
+        scores.color_accuracy   * weights['color_accuracy'] +\
+        scores.structural_fidelity * weights['structural_fidelity'] +\
+        scores.brand_integrity  * weights['brand_integrity'] +\
+        scores.ghost_quality    * weights['ghost_quality'] +\
+        scores.perceptual_quality * weights['perceptual_quality'] +\
+        scores.technical_specs  * weights['technical_specs']\
+    )\
+\
+# -------------------------\
+# Core QA pipeline\
+# -------------------------\
+def _resolution_pass(w: int, h: int, expected: Optional[int], allow_m8: bool) -> bool:\
+    if w != h:\
+        return False\
+    if expected is not None:\
+        return w == expected\
+    if allow_m8:\
+        return (w % 8 == 0) and (w >= 1024) and (w <= 4096)\
+    return w in (1024, 1536, 2048)\
+\
+def run_qa_for_image(\
+    rgb_u8: np.ndarray,\
+    mask_u8: np.ndarray,\
+    json_specs: Dict[str, Any],\
+    assessor: Optional[PerceptualAssessor] = None,\
+    reference_rgb_u8: Optional[np.ndarray] = None,\
+    delta_e_strict: float = 2.0,\
+    delta_e_max: float = 4.0,\
+    expected_size: Optional[int] = None,\
+    allow_m8: bool = False,\
+    compute_ssim: bool = False\
+) -> Dict[str, Any]:\
+    h,w,_ = rgb_u8.shape\
+    tech = \{\
+        "resolution": f"\{w\}x\{h\}",\
+        "resolution_pass": _resolution_pass(w,h,expected_size,allow_m8),\
+        "background_pass": True\
+    \}\
+\
+    primary_hex = _get(json_specs, ["color_extraction","primary_color","hex_value"], None)\
+    color_metrics = \{"mean_delta_e": 999.0, "p95_delta_e": 999.0, "max_delta_e": 999.0\}\
+    color_pass_strict = color_pass_acceptable = True\
+    if primary_hex:\
+        color_metrics = mean_delta_e2000_rgb(rgb_u8, mask_u8, primary_hex)\
+        color_pass_strict = color_metrics["mean_delta_e"] <= delta_e_strict\
+        color_pass_acceptable = color_metrics["p95_delta_e"] <= delta_e_max\
+\
+    struct = detect_structure(rgb_u8, mask_u8, json_specs)\
+\
+    label_bbox_norm = _get(json_specs, ["brand_information","label_bbox_norm"], None)\
+    label_text = _get(json_specs, ["brand_information","label_text"], None)\
+    label_bbox_px = None\
+    if label_bbox_norm and isinstance(label_bbox_norm, (list,tuple)) and len(label_bbox_norm)==4:\
+        x0,y0,x1,y1 = label_bbox_norm\
+        label_bbox_px = (int(round(x0*w)), int(round(y0*h)), int(round(x1*w)), int(round(y1*h)))\
+    label_res = validate_label(rgb_u8, label_bbox_px, expected_text=label_text, contrast_threshold=4.5)\
+\
+    hollow = validate_hollow(rgb_u8, mask_u8)\
+\
+    sharp = PerceptualAssessor.sharpness_laplacian(rgb_u8)\
+    rmsc  = PerceptualAssessor.rms_contrast(rgb_u8)\
+    lp = None; ssim = None\
+    if assessor and reference_rgb_u8 is not None:\
+        lp = assessor.lpips_distance(rgb_u8, reference_rgb_u8)\
+        if compute_ssim:\
+            # SSIM on grayscale, normalized\
+            ssim = float(sk_ssim(cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2GRAY),\
+                                 cv2.cvtColor(reference_rgb_u8, cv2.COLOR_RGB2GRAY)))\
+\
+    color_score = max(0.0, 1.0 - (color_metrics["mean_delta_e"]/4.0)) if primary_hex else 0.7\
+    struct_penalties = 0\
+    if "button_count_ok" in struct.accuracy_flags and not struct.accuracy_flags["button_count_ok"]:\
+        struct_penalties += 0.3\
+    if "zipper_present_ok" in struct.accuracy_flags and not struct.accuracy_flags["zipper_present_ok"]:\
+        struct_penalties += 0.3\
+    struct_score = max(0.0, 1.0 - struct_penalties)\
+    brand_score = 1.0 if label_res.overall_pass else 0.4\
+    ghost_score = 1.0 if hollow.overall_hollow_quality else 0.4\
+    perc_score = min(1.0, sharp/200.0)\
+    tech_score = 1.0 if (tech["resolution_pass"] and tech["background_pass"]) else 0.5\
+\
+    return \{\
+        "technical_validation": tech,\
+        "color_metrics": color_metrics,\
+        "color_pass": \{"strict": color_pass_strict, "acceptable": color_pass_acceptable, "primary_hex": primary_hex\},\
+        "structure_validation": \{\
+            "buttons_detected": struct.buttons_detected,\
+            "zipper_detected": struct.zipper_detected,\
+            "pockets_hint": struct.pockets_hint,\
+            "accuracy_flags": struct.accuracy_flags,\
+        \},\
+        "label_integrity": asdict(label_res),\
+        "ghost_quality": \{\
+            "overall_hollow_quality": hollow.overall_hollow_quality,\
+            "openings": hollow.openings,\
+            "total_openings_detected": hollow.total_openings_detected\
+        \},\
+        "perceptual_quality": \{\
+            "sharpness_var_laplacian": sharp,\
+            "rms_contrast": rmsc,\
+            "lpips": lp,\
+            "ssim_gray": ssim\
+        \},\
+        "scores": \{\
+            "color_accuracy": color_score,\
+            "structural_fidelity": struct_score,\
+            "brand_integrity": brand_score,\
+            "ghost_quality": ghost_score,\
+            "perceptual_quality": perc_score,\
+            "technical_specs": tech_score\
+        \}\
+    \}\
+\
+# -------------------------\
+# Candidate processing (for parallelism)\
+# -------------------------\
+def process_candidate(cp: Path,\
+                      specs: Dict[str, Any],\
+                      assessor: Optional[PerceptualAssessor],\
+                      provided_mask: Optional[np.ndarray],\
+                      primary_hex: Optional[str],\
+                      label_bbox_norm: Optional[List[float]],\
+                      reference_rgb: Optional[np.ndarray],\
+                      args) -> Tuple[str, Dict[str, Any], np.ndarray, np.ndarray, List[Tuple[int,int,int,int]], List[Tuple[int,int,int]]]:\
+    cid = cp.stem\
+    rgb, alpha = _read_image_with_alpha(cp)\
+\
+    # Mask resolution\
+    if provided_mask is not None:\
+        mask = _ensure_same_size(rgb, provided_mask)\
+    elif alpha is not None:\
+        mask = _normalize_mask(alpha)\
+    else:\
+        guess = cp.parent / "mask.png"\
+        if guess.exists():\
+            mm = Image.open(guess).convert("L")\
+            mask = _normalize_mask(np.array(mm))\
+        else:\
+            gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)\
+            thr = max(10, int(np.percentile(gray, 40)))\
+            _, mask = cv2.threshold(gray, thr, 255, cv2.THRESH_BINARY_INV)\
+\
+    mask = _ensure_same_size(rgb, mask)\
+\
+    qa1 = run_qa_for_image(\
+        rgb, mask, specs, assessor=assessor, reference_rgb_u8=reference_rgb,\
+        expected_size=args.expected_size, allow_m8=args.allow_multiple_of_8,\
+        compute_ssim=bool(reference_rgb is not None)\
+    )\
+\
+    label_bbox_px = None\
+    if label_bbox_norm:\
+        h,w,_ = rgb.shape\
+        x0,y0,x1,y1 = label_bbox_norm\
+        label_bbox_px = (int(round(x0*w)), int(round(y0*h)), int(round(x1*w)), int(round(y1*h)))\
+\
+    needs_label_boost = not qa1["label_integrity"]["contrast_pass"]\
+    corrected = rgb.copy(); applied = []\
+    if args.apply_corrections:\
+        corrector = AutoCorrector(exclude_label_bbox=label_bbox_px)\
+        corrected, applied = corrector.apply(\
+            corrected, mask, target_hex=(primary_hex if args.target_hex_from_json else None),\
+            needs_label_contrast_boost=needs_label_boost,\
+            label_bbox_px=label_bbox_px\
+        )\
+\
+    qa2 = run_qa_for_image(\
+        corrected, mask, specs, assessor=assessor, reference_rgb_u8=reference_rgb,\
+        expected_size=args.expected_size, allow_m8=args.allow_multiple_of_8,\
+        compute_ssim=bool(reference_rgb is not None)\
+    )\
+\
+    # Structural overlays\
+    struct2 = detect_structure(corrected, mask, specs)\
+\
+    data = \{\
+        "path": str(cp),\
+        "hash_before": _img_hash(rgb),\
+        "hash_after": _img_hash(corrected),\
+        "qa_before": qa1,\
+        "qa_after": qa2,\
+        "corrections_applied": applied\
+    \}\
+    return cid, data, corrected, mask, struct2.zipper_lines, struct2.button_circles\
+\
+# -------------------------\
+# CLI orchestration\
+# -------------------------\
+def main():\
+    ap = argparse.ArgumentParser(description="Step 4/6: Auto-QA + Auto-Correct + Candidate Selection")\
+    ap.add_argument("--candidates", nargs="+", help="Candidate image(s) or a single folder with images")\
+    ap.add_argument("--json", required=True, help="Path to garment_analysis.json")\
+    ap.add_argument("--mask", help="Binary mask (uint8 0/255). If omitted, use candidate alpha if present or ./mask.png nearby")\
+    ap.add_argument("-o","--outdir", default="./step4", help="Output directory")\
+    ap.add_argument("--target-hex-from-json", action="store_true", help="Use primary hex from JSON for \uc0\u916 E & color correction")\
+    ap.add_argument("--apply-corrections", action="store_true", help="Apply auto-corrections (color/bg/label/recenter)")\
+    ap.add_argument("--weights", help="JSON with custom ranking weights")\
+    ap.add_argument("--reference", help="Optional reference image for perceptual comparison (LPIPS/SSIM)")\
+    ap.add_argument("--thumb-size", type=int, default=768, help="Thumbnail max size for final_thumb.webp")\
+    ap.add_argument("--expected-size", type=int, default=None, help="Exact expected square size (e.g., 2048). If unset, uses defaults.")\
+    ap.add_argument("--allow-multiple-of-8", action="store_true", help="Accept any square multiple-of-8 between 1024..4096")\
+    ap.add_argument("--workers", type=int, default=0, help="Parallel worker threads for candidate QA/correct")\
+    ap.add_argument("--export-corrected", action="store_true", help="Save per-candidate corrected images")\
+    ap.add_argument("--export-deltae-heatmap", action="store_true", help="Save deltaE heatmap for the winner")\
+    args = ap.parse_args()\
+\
+    outdir = Path(args.outdir); outdir.mkdir(parents=True, exist_ok=True)\
+\
+    # Resolve candidates\
+    cand_paths: List[Path] = []\
+    if args.candidates and len(args.candidates)==1 and Path(args.candidates[0]).is_dir():\
+        cand_paths = sorted([p for p in Path(args.candidates[0]).glob("*") if p.suffix.lower() in (".png",".jpg",".jpeg",".webp")])\
+    else:\
+        for c in (args.candidates or []):\
+            p = Path(c)\
+            if p.is_dir():\
+                cand_paths.extend(sorted([q for q in p.glob("*") if q.suffix.lower() in (".png",".jpg",".jpeg",".webp")]))\
+            else:\
+                cand_paths.append(p)\
+    if not cand_paths:\
+        print("No candidates found.", file=sys.stderr); sys.exit(2)\
+\
+    # Load JSON specs\
+    with open(args.json, "r", encoding="utf-8") as f:\
+        specs = json.load(f)\
+\
+    # Optional reference\
+    reference_rgb = _read_image(args.reference) if args.reference else None\
+\
+    # Optional weights\
+    weights = DEFAULT_WEIGHTS.copy()\
+    if args.weights:\
+        try:\
+            with open(args.weights, "r", encoding="utf-8") as wf:\
+                wj = json.load(wf); weights.update(\{k: float(v) for k,v in wj.items() if k in weights\})\
+        except Exception as e:\
+            warnings.warn(f"Failed to load weights: \{e\}")\
+\
+    # Mask input\
+    provided_mask = None\
+    if args.mask:\
+        m = Image.open(args.mask)\
+        if m.mode != "L": m = m.convert("L")\
+        provided_mask = _normalize_mask(np.array(m))\
+\
+    assessor = PerceptualAssessor() if _HAS_LPIPS else None\
+    primary_hex = _get(specs, ["color_extraction","primary_color","hex_value"], None) if args.target_hex_from_json else None\
+    label_bbox_norm = _get(specs, ["brand_information","label_bbox_norm"], None)\
+\
+    per_candidate = \{\}\
+    corrected_images: Dict[str, np.ndarray] = \{\}\
+    mask_used_map: Dict[str, np.ndarray] = \{\}\
+    debug_line_map: Dict[str, List[Tuple[int,int,int,int]]] = \{\}\
+    debug_circle_map: Dict[str, List[Tuple[int,int,int]]] = \{\}\
+\
+    # Process (optionally parallel)\
+    if args.workers and args.workers > 0:\
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:\
+            futs = \{\
+                ex.submit(process_candidate, cp, specs, assessor, provided_mask, primary_hex,\
+                          label_bbox_norm, reference_rgb, args): cp\
+                for cp in cand_paths\
+            \}\
+            for fut in as_completed(futs):\
+                cid, data, corrected, mask, lines, circles = fut.result()\
+                per_candidate[cid] = data; corrected_images[cid] = corrected; mask_used_map[cid] = mask\
+                debug_line_map[cid] = lines; debug_circle_map[cid] = circles\
+    else:\
+        for cp in cand_paths:\
+            cid, data, corrected, mask, lines, circles = process_candidate(\
+                cp, specs, assessor, provided_mask, primary_hex, label_bbox_norm, reference_rgb, args\
+            )\
+            per_candidate[cid] = data; corrected_images[cid] = corrected; mask_used_map[cid] = mask\
+            debug_line_map[cid] = lines; debug_circle_map[cid] = circles\
+\
+    # Rank (use post-correction scores)\
+    rankings = []\
+    for cid, data in per_candidate.items():\
+        s = data["qa_after"]["scores"]\
+        cs = CandidateScores(\
+            color_accuracy=s["color_accuracy"],\
+            structural_fidelity=s["structural_fidelity"],\
+            brand_integrity=s["brand_integrity"],\
+            ghost_quality=s["ghost_quality"],\
+            perceptual_quality=s["perceptual_quality"],\
+            technical_specs=s["technical_specs"]\
+        )\
+        score = composite_score(cs, weights)\
+        rankings.append(\{"id": cid, "score": score\})\
+    rankings.sort(key=lambda x: x["score"], reverse=True)\
+\
+    best = rankings[0]; best_id = best["id"]\
+    final_img = corrected_images[best_id]\
+    final_mask = mask_used_map[best_id]\
+\
+    # Save artifacts\
+    final_path = outdir / "final.png"; _save_png(final_path, final_img)\
+\
+    # Optional export per-candidate corrected\
+    if args.export_corrected:\
+        c_dir = outdir / "corrected"; c_dir.mkdir(exist_ok=True)\
+        for cid, img in corrected_images.items():\
+            _save_png(c_dir / f"\{cid\}_corrected.png", img)\
+\
+    # Thumb\
+    H,W,_ = final_img.shape\
+    scale = args.thumb_size / max(H,W)\
+    thumb = cv2.resize(final_img, (int(W*scale), int(H*scale)), interpolation=cv2.INTER_AREA) if scale < 1.0 else final_img\
+    _save_webp(outdir / "final_thumb.webp", thumb, quality=90)\
+\
+    # Debug overlay\
+    label_bbox_px_global = None\
+    if label_bbox_norm:\
+        x0,y0,x1,y1 = label_bbox_norm\
+        label_bbox_px_global = (int(round(x0*W)), int(round(y0*H)), int(round(x1*W)), int(round(y1*H)))\
+    overlay = _draw_debug_overlay(\
+        final_img, final_mask, label_bbox_px_global,\
+        debug_line_map.get(best_id, []),\
+        debug_circle_map.get(best_id, [])\
+    )\
+    _save_png(outdir / "debug_overlay.png", overlay)\
+\
+    # Optional deltaE heatmap for winner\
+    if args.export_deltae_heatmap and primary_hex:\
+        # quick coarse \uc0\u916 E map (downsampled for speed)\
+        rgb = final_img.astype(np.float32)/255.0\
+        lab = skcolor.rgb2lab(rgb)\
+        t_lab = skcolor.rgb2lab(_hex_to_rgb01(primary_hex).reshape(1,1,3))[0,0]\
+        de = skcolor.deltaE_ciede2000(lab, t_lab)\
+        de_norm = np.clip(de / 5.0, 0, 1)  # normalize to [0..1] around 5 \uc0\u916 E\
+        heat = (cv2.applyColorMap((de_norm*255).astype(np.uint8), cv2.COLORMAP_INFERNO)[:,:,::-1])\
+        mix = (0.6*final_img + 0.4*heat).astype(np.uint8)\
+        _save_png(outdir / "deltaE_heatmap.png", mix)\
+\
+    # QA report\
+    qa_report = \{\
+        "timestamp": _now_iso(),\
+        "selected_candidate": best_id,\
+        "rankings": rankings,\
+        "candidates": per_candidate\
+    \}\
+    (outdir / "qa_report.json").write_text(json.dumps(qa_report, indent=2), encoding="utf-8")\
+\
+    # Provenance\
+    prov = \{\
+        "timestamp": _now_iso(),\
+        "inputs": \{\
+            "json": str(Path(args.json).resolve()),\
+            "candidates": [str(p.resolve()) for p in cand_paths],\
+            "mask": str(Path(args.mask).resolve()) if args.mask else None,\
+            "reference": str(Path(args.reference).resolve()) if args.reference else None\
+        \},\
+        "config": \{\
+            "weights": weights,\
+            "apply_corrections": bool(args.apply_corrections),\
+            "target_hex_from_json": bool(args.target_hex_from_json),\
+            "thumb_size": int(args.thumb_size),\
+            "expected_size": args.expected_size,\
+            "allow_multiple_of_8": bool(args.allow_multiple_of_8),\
+            "workers": int(args.workers)\
+        \},\
+        "env": \{\
+            "python": sys.version,\
+            "opencv": cv2.__version__,\
+            "skimage": getattr(skcolor, "__name__", "skimage.color"),\
+            "lpips_available": _HAS_LPIPS,\
+            "easyocr_available": _HAS_EASYOCR,\
+            "tesseract_available": _HAS_TESSERACT,\
+        \}\
+    \}\
+    (outdir / "provenance.json").write_text(json.dumps(prov, indent=2), encoding="utf-8")\
+\
+    print(f"\uc0\u9989  Saved final: \{final_path\}")\
+    print(f"\uc0\u55358 \u56810  QA report: \{outdir / 'qa_report.json'\}")\
+    print(f"\uc0\u55358 \u56830  Provenance: \{outdir / 'provenance.json'\}")\
+    print(f"\uc0\u55357 \u56764 \u65039  Debug overlay: \{outdir / 'debug_overlay.png'\}")\
+    print(f"\uc0\u55356 \u57286  Winner: \{best_id\} (score=\{best['score']:.3f\})")\
+\
+if __name__ == "__main__":\
+    main()}

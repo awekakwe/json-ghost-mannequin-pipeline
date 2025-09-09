@@ -1,0 +1,158 @@
+# Custom Style Configuration for Dress Processing
+# Enhanced settings for elegant dress photography
+
+# Global Style Settings
+style:
+  brand: "photostudio.io"
+  aesthetic: "luxury_elegant"
+  color_profile: "adobe_rgb"  # Higher color gamut for fashion
+
+# Custom Dress Templates  
+templates:
+  dress_elegant:
+    base_prompt: "luxury fashion photography, {garment_description}, invisible mannequin technique, pristine white background, high-end studio lighting"
+    style_modifiers:
+      - "flowing elegant silhouette"
+      - "premium fabric texture"
+      - "sophisticated draping"
+      - "couture quality"
+      - "editorial style"
+      - "ultra-high resolution"
+    negative_prompt: "cheap fabric, wrinkled, model, person, cluttered background, poor lighting, fast fashion"
+    
+  dress_casual:
+    base_prompt: "contemporary fashion photography, {garment_description}, ghost mannequin effect, clean white background"
+    style_modifiers:
+      - "natural fabric fall"
+      - "everyday elegance"
+      - "comfortable fit"
+      - "modern styling"
+    negative_prompt: "model, person, colored background, shadows"
+
+# Enhanced Style Guardrails for Dresses
+guardrails:
+  forbidden_terms:
+    - "model"
+    - "person" 
+    - "human"
+    - "wearing"
+    - "mannequin head"
+    - "face"
+    - "hands"
+    - "skin"
+    - "cheap"
+    - "fast fashion"
+    
+  required_terms:
+    - "white background"
+    - "professional"
+    - "luxury" 
+    - "elegant"
+    
+  quality_terms:
+    - "ultra-high resolution"
+    - "sharp focus"
+    - "editorial quality"
+    - "studio lighting"
+    - "premium"
+
+# Color Guidance for Dresses
+color_guidance:
+  primary_enhancement: 1.3  # Boost primary dress color more
+  background_purity: 0.98   # Very pure white background
+  contrast_min: 0.4         # Higher contrast for elegant look
+  saturation_boost: 1.1     # Slight saturation increase
+  
+# Dress-Specific Fabric Adjustments
+fabric_adjustments:
+  silk:
+    texture_emphasis: 1.5
+    lighting: "controlled specular with highlights"
+    sheen_factor: 1.0
+    
+  chiffon:
+    texture_emphasis: 1.2
+    lighting: "soft backlit"
+    transparency_handling: "delicate"
+    
+  satin:
+    texture_emphasis: 1.4
+    lighting: "directional with highlights"
+    sheen_factor: 1.2
+    
+  lace:
+    texture_emphasis: 1.6
+    lighting: "detailed directional"
+    pattern_enhancement: 1.3
+    
+  cotton:
+    texture_emphasis: 1.0
+    lighting: "even natural"
+    
+  polyester:
+    texture_emphasis: 0.8
+    lighting: "soft diffused"
+
+# Enhanced Rendering Parameters for Dresses
+rendering:
+  sdxl:
+    guidance_scale: 8.5      # Higher guidance for better quality
+    num_inference_steps: 60  # More steps for detail
+    strength: 0.85           # Stronger transformation
+    
+  controlnet:
+    conditioning_scale: 1.1  # Stronger structure guidance
+    guess_mode: false
+    
+  ip_adapter:
+    scale: 0.5               # Lower for more original structure
+    
+# Stricter Quality Thresholds for Luxury Dresses
+quality_thresholds:
+  min_delta_e: 1.5          # Tighter color accuracy
+  min_hollow_quality: 0.5   # Better hollow effect required
+  min_sharpness: 0.4        # Higher sharpness standards
+  min_background_score: 0.9 # Nearly perfect background
+  min_composite_score: 0.7  # Higher overall quality
+
+# Dress-Specific Template Variations
+variations:
+  elegance:
+    - "luxury fashion"
+    - "haute couture"
+    - "designer quality"
+    - "premium fashion"
+    
+  lighting:
+    - "high-end studio lighting"
+    - "professional fashion lighting"
+    - "editorial lighting setup"
+    - "luxury brand photography lighting"
+    
+  quality:
+    - "ultra-high resolution"
+    - "editorial quality"
+    - "luxury brand standard"
+    - "couture photography"
+    
+  background:
+    - "pristine white background"
+    - "pure white studio background" 
+    - "seamless white backdrop"
+    - "professional white cyc"
+
+# Advanced Settings
+advanced:
+  # Multi-angle support for dresses
+  angle_variations:
+    - "front view"
+    - "side profile"
+    - "back view"
+    - "three-quarter view"
+  
+  # Dress-specific quality checks
+  dress_quality_checks:
+    hemline_straightness: true
+    fabric_draping: true
+    silhouette_accuracy: true
+    zipper_visibility: false

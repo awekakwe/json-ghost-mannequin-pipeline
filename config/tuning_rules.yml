@@ -1,0 +1,210 @@
+# Auto-Tuning Rules for Ghost-Mannequin Pipeline
+# Defines conditions and parameter adjustments for automatic optimization
+
+rules:
+  # Color Quality Tuning
+  - name: "high_delta_e_guidance_increase"
+    description: "Increase guidance scale when color accuracy is poor"
+    trigger_condition: "high_delta_e"
+    parameter: "guidance_scale"
+    adjustment: 0.5  # Increase by 0.5
+    confidence: 0.8
+    cooldown_hours: 12
+    conditions:
+      avg_delta_e_threshold: 2.5
+      min_runs: 5
+    
+  - name: "very_high_delta_e_route_switch"
+    description: "Switch to Route B when color accuracy is extremely poor"
+    trigger_condition: "high_delta_e"
+    parameter: "route"
+    adjustment: "B"
+    confidence: 0.9
+    cooldown_hours: 24
+    conditions:
+      avg_delta_e_threshold: 4.0
+      min_runs: 3
+
+  # Hollow Quality Tuning
+  - name: "low_hollow_quality_strength_increase"
+    description: "Increase ControlNet strength for better hollow effect"
+    trigger_condition: "low_hollow_quality"
+    parameter: "controlnet_strength"
+    adjustment: 0.1
+    confidence: 0.7
+    cooldown_hours: 8
+    conditions:
+      avg_hollow_quality_threshold: 0.3
+      min_runs: 5
+      
+  - name: "poor_hollow_quality_route_switch"
+    description: "Switch to Route B when hollow effect consistently fails"
+    trigger_condition: "low_hollow_quality"
+    parameter: "route"
+    adjustment: "B"
+    confidence: 0.6
+    cooldown_hours: 24
+    conditions:
+      avg_hollow_quality_threshold: 0.25
+      min_runs: 8
+
+  # Performance Optimization
+  - name: "high_latency_steps_reduction"
+    description: "Reduce inference steps to improve speed"
+    trigger_condition: "high_latency"
+    parameter: "num_inference_steps"
+    adjustment: -5  # Reduce by 5 steps
+    confidence: 0.6
+    cooldown_hours: 6
+    conditions:
+      avg_processing_time_threshold: 45.0  # seconds
+      min_runs: 3
+      
+  - name: "very_high_latency_route_switch"
+    description: "Switch to faster Route B for performance"
+    trigger_condition: "high_latency"
+    parameter: "route"
+    adjustment: "B"
+    confidence: 0.8
+    cooldown_hours: 24
+    conditions:
+      avg_processing_time_threshold: 60.0  # seconds
+      min_runs: 5
+
+  # Success Rate Tuning
+  - name: "low_success_rate_seed_rotation"
+    description: "Rotate random seeds when success rate drops"
+    trigger_condition: "low_success_rate"
+    parameter: "seed"
+    adjustment: "rotate"
+    confidence: 0.5
+    cooldown_hours: 4
+    conditions:
+      success_rate_threshold: 0.7
+      min_runs: 10
+      
+  - name: "very_low_success_rate_template_switch"
+    description: "Switch prompt template when success rate is very low"
+    trigger_condition: "low_success_rate"
+    parameter: "template_variant"
+    adjustment: "alternative"
+    confidence: 0.6
+    cooldown_hours: 12
+    conditions:
+      success_rate_threshold: 0.5
+      min_runs: 15
+
+  # Sharpness Optimization
+  - name: "low_sharpness_guidance_increase"
+    description: "Increase guidance for better image sharpness"
+    trigger_condition: "low_sharpness"
+    parameter: "guidance_scale"
+    adjustment: 0.5
+    confidence: 0.7
+    cooldown_hours: 8
+    conditions:
+      avg_sharpness_threshold: 0.25
+      min_runs: 5
+      
+  - name: "very_low_sharpness_steps_increase"
+    description: "Increase inference steps for better quality"
+    trigger_condition: "low_sharpness" 
+    parameter: "num_inference_steps"
+    adjustment: 10
+    confidence: 0.6
+    cooldown_hours: 12
+    conditions:
+      avg_sharpness_threshold: 0.2
+      min_runs: 8
+
+  # Background Quality
+  - name: "poor_background_ip_adapter_reduce"
+    description: "Reduce IP-Adapter scale when background quality is poor"
+    trigger_condition: "poor_background"
+    parameter: "ip_adapter_scale"
+    adjustment: -0.1
+    confidence: 0.6
+    cooldown_hours: 6
+    conditions:
+      avg_background_score_threshold: 0.7
+      min_runs: 5
+
+  # Composite Score Optimization
+  - name: "low_composite_score_comprehensive_tune"
+    description: "Apply comprehensive tuning when overall quality is low"
+    trigger_condition: "low_composite_score"
+    parameter: "comprehensive_tune"
+    adjustment: "apply"
+    confidence: 0.8
+    cooldown_hours: 24
+    conditions:
+      avg_composite_score_threshold: 0.5
+      min_runs: 10
+
+# Advanced Rules with Multiple Conditions
+advanced_rules:
+  - name: "fabric_specific_cotton_optimization"
+    description: "Optimize for cotton garments specifically"
+    trigger_conditions:
+      - "fabric_type == 'cotton'"
+      - "avg_delta_e > 2.0"
+    adjustments:
+      guidance_scale: 8.0
+      controlnet_conditioning_scale: 1.1
+    confidence: 0.7
+    cooldown_hours: 12
+    
+  - name: "dark_garment_lighting_adjustment" 
+    description: "Adjust for dark colored garments"
+    trigger_conditions:
+      - "primary_color_lightness < 0.3"
+      - "low_hollow_quality"
+    adjustments:
+      guidance_scale: 8.5
+      ip_adapter_scale: 0.4
+    confidence: 0.6
+    cooldown_hours: 8
+
+# Emergency Rules (High Priority)
+emergency_rules:
+  - name: "critical_failure_rate_emergency_switch"
+    description: "Emergency switch to Route B when failure rate is critical"
+    trigger_condition: "critical_failure_rate"
+    parameter: "route"
+    adjustment: "B"
+    confidence: 0.95
+    cooldown_hours: 1  # Minimal cooldown for emergencies
+    conditions:
+      success_rate_threshold: 0.2  # Less than 20% success
+      min_runs: 5
+      time_window_hours: 2  # In the last 2 hours
+    priority: "emergency"
+
+# Global Tuning Configuration
+global_config:
+  max_concurrent_adjustments: 3  # Maximum number of simultaneous parameter changes
+  confidence_decay_rate: 0.1  # How much confidence decreases over time
+  effectiveness_learning_rate: 0.05  # How quickly to learn from adjustment outcomes
+  rollback_threshold: 0.3  # Confidence threshold below which to rollback changes
+  
+# Monitoring Thresholds
+monitoring:
+  delta_e_warning: 2.0
+  delta_e_critical: 3.5
+  hollow_quality_warning: 0.4
+  hollow_quality_critical: 0.25
+  success_rate_warning: 0.8
+  success_rate_critical: 0.6
+  processing_time_warning: 30.0  # seconds
+  processing_time_critical: 60.0  # seconds
+  
+# Learning Configuration
+learning:
+  enable_effectiveness_tracking: true
+  min_evaluation_period_hours: 24
+  adjustment_success_threshold: 0.1  # Minimum improvement to consider adjustment successful
+  parameter_bounds:
+    guidance_scale: [3.0, 15.0]
+    num_inference_steps: [20, 100]
+    controlnet_conditioning_scale: [0.5, 1.5]
+    ip_adapter_scale: [0.1, 1.0]

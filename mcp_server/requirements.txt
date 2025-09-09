@@ -1,0 +1,5 @@
+# MCP Server Dependencies for PhotoStudio Pipeline
+mcp>=1.0.0
+asyncio
+pathlib
+typing-extensions
